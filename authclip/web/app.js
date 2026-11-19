@@ -22,6 +22,7 @@ const state = {
   busy: false,
   drafts: new Map(),
   reveal: new Set(),
+  pending: null, // { id, gen }：打开授权页时的任务与代次
   stopStream: null,
 };
 
@@ -165,6 +166,11 @@ function dropStaleDrafts() {
       state.drafts.delete(id);
       dropped++;
     }
+  }
+  // 待自动填入的上下文也要一起作废（否则切回来会用剪贴板里的旧回调）
+  if (state.pending && gen.get(state.pending.id) !== state.pending.gen) {
+    state.pending = null;
+    dropped++;
   }
   if (dropped > 0) {
     state.feedback = "授权链接已更新，之前的草稿已清空，请重新粘贴回调链接。";
@@ -783,7 +789,7 @@ function copyGuide() {
 // 弹窗打开授权链接：noopener 让授权页拿不到 window.opener（防反向跳转劫持），
 // 代价是拿不到 handle，所以「用户是否回来了」靠 visibilitychange 判断。
 function openAuth(slot) {
-  state.pendingSlot = slot.id;
+  state.pending = { id: slot.id, gen: slot.link_gen ?? 0 };
   const w = window.open(slot.link, "authclip", "popup=yes,width=560,height=800,noopener");
   // noopener 时返回 null 是正常的，不能用它判断是否被拦。
   // 真弹窗会抢焦点，所以用「500ms 后本页是否还持有焦点」做启发式。
@@ -795,15 +801,24 @@ function openAuth(slot) {
 
 // 用户从授权页切回来时，自动尝试读剪贴板并填入（没权限就静默跳过，不打扰）
 async function tryAutoPaste() {
-  const id = state.pendingSlot;
-  if (!id || state.role !== "member") return;
+  const pend = state.pending;
+  if (!pend || state.role !== "member") return;
+  // 打开授权页之后可能发生过换链：代次不符就不再自动填，
+  // 否则剪贴板里的上一轮回调会被挂到新一轮任务上。
+  const slot = (state.mine.slots || []).find((s) => s.id === pend.id);
+  if (!slot || (slot.link_gen ?? 0) !== pend.gen) {
+    state.pending = null;
+    flash("授权链接已更换，请重新打开授权链接后再复制回调。", "err");
+    return;
+  }
   try {
     const text = await navigator.clipboard.readText();
     const p = parseCallback(text);
     if (!p?.code) return;
-    const cur = state.drafts.get(id) || {};
-    state.drafts.set(id, { ...cur, callback: text });
-    state.pendingSlot = "";
+    const gen = slot.link_gen ?? 0;
+    const cur = state.drafts.get(pend.id) || { gen };
+    state.drafts.set(pend.id, { ...cur, callback: text, gen });
+    state.pending = null;
     flash("已从剪贴板自动填入 code，核对后提交");
   } catch { /* 没有剪贴板权限：留给按钮 */ }
 }
@@ -1104,13 +1119,15 @@ document.addEventListener("visibilitychange", () => {
   if (document.visibilityState !== "visible" || !state.token) return;
   void refresh();
   // 从授权小窗切回来：先给剪贴板一点写入时间，再尝试自动填入
-  if (state.pendingSlot) setTimeout(() => void tryAutoPaste(), 300);
+  if (state.pending) setTimeout(() => void tryAutoPaste(), 300);
 });
 window.addEventListener("focus", () => {
-  if (state.pendingSlot) void tryAutoPaste();
+  if (state.pending) void tryAutoPaste();
 });
 
 void start();
+
+
 
 
 

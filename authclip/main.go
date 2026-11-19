@@ -55,7 +55,7 @@ const (
 	maxBody    = 128 << 10
 	maxLink    = 8192
 	sessionEC  = 20 * time.Second
-	appVersion = "v1.4.6" // v1.4.5: 链接代次｜v1.4.6: 换链作废浏览器草稿 / 轮换原子落盘
+	appVersion = "v1.4.7" // v1.4.6: 草稿作废 / 轮换原子｜v1.4.7: 自动填入也受代次约束
 )
 
 // ---------------------------------------------------------------- 模型
@@ -2087,6 +2087,7 @@ func plausibleURL(s string) bool {
 	}
 	return host != "" && !strings.ContainsAny(host, " \t\r\n")
 }
+
 
 
 

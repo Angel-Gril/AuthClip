@@ -639,3 +639,43 @@ POST /rotate -> 500 且响应不含 link
 ```
 PASS TestRotateIsAtomicOnWriteFailure  写失败时令牌不变、旧链接可用、无残留审计
 ```
+
+## 二十三、v1.4.7：自动填入也受链接代次约束
+
+### 问题
+
+v1.4.6 作废了"表单草稿"，但**自动填入**这条路径还带着自己的状态：
+`openAuth()` 只记住 `pendingSlot = 任务 id`。于是：
+
+```
+B 点「打开授权链接」        -> pending = 任务 id（无代次）
+A 换链（gen 1 → 2，state 不变）
+B 切回页面 -> focus -> tryAutoPaste()
+  读剪贴板里的上一轮回调 -> 新建草稿（带刚刷新的新代次）-> 提交通过
+```
+
+草稿被清了，但自动填入**重建**了一份，等于把旧数据洗白。
+
+### 修复
+
+`pending` 从「任务 id」改成「任务 id + 打开时的代次」：
+
+```js
+state.pending = { id: slot.id, gen: slot.link_gen };
+```
+
+- `tryAutoPaste()` 先比对当前 `slot.link_gen`；不符则**不填**，清掉 pending，提示「授权链接已更换，请重新打开授权链接后再复制回调」
+- `dropStaleDrafts()` 同时作废 pending（不用等 focus）
+- 新建草稿时把代次写死为当前的 `link_gen`
+
+### 实测（浏览器内，真 SSE 推送）
+
+```
+点开授权链接 -> pending={id, gen:1}
+A 端换链（state 仍为 SAME，gen -> 2）
+切回页面 focus -> textarea 仍为空
+                  提示：授权链接已更新，之前的草稿已清空，请重新粘贴回调链接。
+重新点开授权链接（gen:2）-> focus -> 自动填入恢复工作
+```
+
+即：跨轮次的自动填入被拦住，正常一轮内的自动填入不受影响。
