@@ -42,6 +42,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"embed"
 
@@ -1429,15 +1430,32 @@ func (a *app) exportSlots(w http.ResponseWriter, r *http.Request, u *User) {
 		if s.Deleted {
 			state = "已归档·" + state
 		}
-		_ = cw.Write([]string{
+		row := []string{
 			s.ID, s.Label, state, label[s.Member], label[s.Owner],
 			pick(s.Email, maskEmail), pick(s.Code, maskCode),
 			s.RegRegion, pick(s.RegIP, maskIP), pick(s.SeenIP, maskIP), pick(s.NodeIP, maskIP),
 			s.Created.Format("2006-01-02 15:04"), fmtTime(s.Submitted),
 			boolText(s.Deleted), mode,
-		})
+		}
+		for i, cell := range row {
+			row[i] = spreadsheetText(cell)
+		}
+		_ = cw.Write(row)
 	}
 	cw.Flush()
+}
+
+// spreadsheetText keeps formula-like values as text when opening the CSV in a spreadsheet.
+func spreadsheetText(value string) string {
+	first := strings.TrimLeftFunc(value, func(r rune) bool {
+		return unicode.IsSpace(r) || r == '\ufeff'
+	})
+	if strings.HasPrefix(value, "\t") || strings.HasPrefix(value, "\r") ||
+		strings.HasPrefix(value, "\n") ||
+		(first != "" && strings.ContainsRune("=+-@＝＋－＠", []rune(first)[0])) {
+		return "'" + value
+	}
+	return value
 }
 
 // 脱敏：保留可辨识的形状，去掉可用性

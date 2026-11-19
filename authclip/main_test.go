@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/csv"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -438,6 +439,43 @@ func TestOwnScopeCannotCreateMember(t *testing.T) {
 	}
 	if code, _ := e.call(t, "POST", "/api/members", e.admin.Token, map[string]any{"label": "B3"}); code != http.StatusOK {
 		t.Fatalf("全量管理员建接收人失败：%d", code)
+	}
+}
+
+func TestCSVExportTreatsUserInputAsText(t *testing.T) {
+	e := newEnv(t, "")
+	owner, err := e.app.st.addUser("admin", "all", "+owner", "owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	member, err := e.app.st.addUser("member", "", "\ufeff ＠member", "member")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, label := range []string{"  =example", "-example", "normal, text", "\ttext", "\r\ntext"} {
+		if _, err := e.app.st.createSlot(owner.ID, member.ID, label, "https://example.invalid/task"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/export?format=csv", nil)
+	e.app.exportSlots(rec, req, e.admin)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("CSV export returned %d", rec.Code)
+	}
+	rows, err := csv.NewReader(rec.Body).ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"'\ntext", "'\ttext", "normal, text", "'-example", "'  =example"}
+	if len(rows) != len(want)+1 {
+		t.Fatalf("expected %d rows including the header, got %d", len(want)+1, len(rows))
+	}
+	for i, row := range rows[1:] {
+		if row[1] != want[i] || row[3] != "'\ufeff ＠member" || row[4] != "'+owner" {
+			t.Errorf("row %d has unexpected text cells: %q, %q, %q", i+1, row[1], row[3], row[4])
+		}
 	}
 }
 
