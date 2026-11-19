@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/csv"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -378,7 +379,6 @@ func TestAuditTrail(t *testing.T) {
 	}
 }
 
-
 func TestArchiveKeepsMemberHistory(t *testing.T) {
 	e := newEnv(t, "")
 	id := e.newSlot(t, e.b1)
@@ -441,6 +441,43 @@ func TestOwnScopeCannotCreateMember(t *testing.T) {
 	}
 }
 
+func TestCSVExportTreatsUserInputAsText(t *testing.T) {
+	e := newEnv(t, "")
+	owner, err := e.app.st.addUser("admin", "all", "+owner", "owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	member, err := e.app.st.addUser("member", "", "\ufeff ＠member", "member")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, label := range []string{"  =example", "-example", "normal, text", "\ttext", "\r\ntext"} {
+		if _, err := e.app.st.createSlot(owner.ID, member.ID, label, "https://example.invalid/task"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/export?format=csv", nil)
+	e.app.exportSlots(rec, req, e.admin)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("CSV export returned %d", rec.Code)
+	}
+	rows, err := csv.NewReader(rec.Body).ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"'\ntext", "'\ttext", "normal, text", "'-example", "'  =example"}
+	if len(rows) != len(want)+1 {
+		t.Fatalf("expected %d rows including the header, got %d", len(want)+1, len(rows))
+	}
+	for i, row := range rows[1:] {
+		if row[1] != want[i] || row[3] != "'\ufeff ＠member" || row[4] != "'+owner" {
+			t.Errorf("row %d has unexpected text cells: %q, %q, %q", i+1, row[1], row[3], row[4])
+		}
+	}
+}
+
 func TestExportCSV(t *testing.T) {
 	e := newEnv(t, "")
 	id := e.newSlot(t, e.b1)
@@ -475,7 +512,6 @@ func TestExportCSV(t *testing.T) {
 		t.Fatalf("own 能导出：%d", code)
 	}
 }
-
 
 // asSlice：JSON 里 null 与 [] 都安全处理
 func asSlice(v any) []any {
@@ -623,8 +659,6 @@ func TestExportIsMaskedByDefaultAndAuditedFirst(t *testing.T) {
 	}
 }
 
-
-
 func TestLinkRevealIsPerRequestAndAudited(t *testing.T) {
 	e := newEnv(t, "")
 	// 列表仍然不含 token
@@ -689,7 +723,6 @@ func TestLinkRevealIsPerRequestAndAudited(t *testing.T) {
 		t.Fatal("查看链接未留审计")
 	}
 }
-
 
 // ---------------------------------------------------------------- 用户名
 
@@ -762,7 +795,6 @@ func TestUsernameBackfilledForLegacyData(t *testing.T) {
 		t.Fatalf("派生用户名不对：%q", u.Username)
 	}
 }
-
 
 // ---------------------------------------------------------------- v1.4.1
 
@@ -896,7 +928,6 @@ func TestRelinkClearsPreviousResult(t *testing.T) {
 	}
 }
 
-
 // ---------------------------------------------------------------- v1.4.3
 
 // 换链接的三种情况：改 state、只改 challenge（state 不变）、原样重复写
@@ -951,9 +982,6 @@ func TestRelinkClearsRegardlessOfState(t *testing.T) {
 		t.Fatal("显式保留未留痕（slot.relink.keep）")
 	}
 }
-
-
-
 
 // v1.4.5：换链接与提交并发 —— 同 state 也要拦住旧请求
 func TestReportRejectedAfterRelinkEvenWithSameState(t *testing.T) {
@@ -1050,61 +1078,27 @@ func TestRotateIsAtomicOnWriteFailure(t *testing.T) {
 	}
 }
 
-// v1.5.3：CSV 公式注入
-func TestCSVSafe(t *testing.T) {
+// v1.5.4：与审查方的实现合并后，补一组针对 spreadsheetText 的单元用例
+// （BOM、前导空白、全角符号都比原 csvSafe 覆盖得更全）
+func TestSpreadsheetTextCases(t *testing.T) {
 	cases := map[string]string{
-		"":            "",
-		"normal":      "normal",
-		"=1+1":        "'=1+1",
-		"+A1":         "'+A1",
-		"-2+3":        "'-2+3",
-		"@SUM(A1)":    "'@SUM(A1)",
-		"\tcmd":       "'\tcmd",
-		"\rcmd":       "'\rcmd",
-		"a=b":         "a=b", // 只处理首字符
+		"":                 "",
+		"normal":           "normal",
+		"a=b":              "a=b", // 只处理首字符
+		"=1+1":             "'=1+1",
+		"+A1":              "'+A1",
+		"-2+3":             "'-2+3",
+		"@SUM(A1)":         "'@SUM(A1)",
+		"＝全角":              "'＝全角",
+		"＋全角":              "'＋全角",
+		"  =leading-space": "'  =leading-space",
+		"\ufeff=x":         "'\ufeff=x",
+		"\tcmd":            "'\tcmd",
+		"\r\ncmd":          "'\r\ncmd",
 	}
 	for in, want := range cases {
-		if got := csvSafe(in); got != want {
-			t.Fatalf("csvSafe(%q) = %q，期望 %q", in, got, want)
+		if got := spreadsheetText(in); got != want {
+			t.Fatalf("spreadsheetText(%q) = %q，期望 %q", in, got, want)
 		}
-	}
-}
-
-func TestExportNeutralizesSpreadsheetFormulas(t *testing.T) {
-	e := newEnv(t, "")
-	// 收件人标签与任务备注都以公式字符开头
-	m, err := e.app.st.addUser("member", "", "=HYPERLINK(\"http://x\")", "evil")
-	if err != nil {
-		t.Fatal(err)
-	}
-	code, out := e.call(t, "POST", "/api/slots", e.admin.Token, map[string]any{
-		"member": m.Username, "link": testLink, "label": "=1+1",
-	})
-	if code != http.StatusOK {
-		t.Fatalf("create: %d %v", code, out)
-	}
-	id := out["id"].(string)
-	e.call(t, "POST", "/api/slots/"+id+"/report", m.Token, map[string]any{
-		"email": "a@example.com", "callback": "http://localhost:54545/callback?code=C&state=STATE-ONE",
-	})
-
-	req, _ := http.NewRequest("GET", e.srv.URL+"/api/export?format=csv&secrets=1&confirm=EXPORT", nil)
-	req.Header.Set("X-Token", e.admin.Token)
-	res, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer res.Body.Close()
-	raw, _ := io.ReadAll(res.Body)
-	body := string(raw)
-
-	// 单元格开头若出现裸公式字符即为漏洞
-	for _, bad := range []string{",=1+1,", ",=HYPERLINK", "\n=1+1,", "\n=HYPERLINK"} {
-		if strings.Contains(body, bad) {
-			t.Fatalf("导出未中和公式（命中 %q）：\n%s", bad, body)
-		}
-	}
-	if !strings.Contains(body, "'=1+1") && !strings.Contains(body, "'=HYPERLINK") {
-		t.Fatalf("应加文本前缀：\n%s", body)
 	}
 }

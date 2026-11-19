@@ -21,7 +21,7 @@ const state = {
   feedbackKind: "",
   busy: false,
   // 每个任务只有一份「当前轮次」状态：gen 一变整份作废。
-  // 所有入口（打开授权、自动填入、手动粘贴、按钮）只读写它。
+  // 表单和手动读取剪贴板共用它。
   rounds: new Map(),
   reveal: new Set(),
   stopStream: null,
@@ -156,7 +156,7 @@ function stopStream() {
 }
 
 // 「当前授权轮次」的唯一载体：按任务 id 存一份，带 link_gen。
-// gen 与服务器不一致 = 换了链接 = 整份作废（表单、自动填入、已打开上下文一起失效）。
+// 换链接后，丢弃上一轮的表单草稿。
 function roundFor(slot) {
   const gen = slot.link_gen ?? 0;
   const cur = state.rounds.get(slot.id);
@@ -773,7 +773,7 @@ function copyGuide() {
       el("li", {}, el("b", { text: "整条复制地址栏" }),
         el("span", { class: "hint", text: "：点一下地址栏让整条变蓝 → Ctrl+A → Ctrl+C；手机长按地址栏 → 全选 → 复制。" })),
       el("li", {}, el("b", { text: "回到本页粘贴" }),
-        el("span", { class: "hint", text: "：粘进下面的框，系统自动切出 code 并核对 state。" })),
+        el("span", { class: "hint", text: "：在对应任务中粘贴，或点该任务的「读剪贴板并解析」。" })),
     ),
   );
   wrap.querySelector(".guide").innerHTML = `
@@ -814,9 +814,7 @@ function copyGuide() {
 }
 
 // 弹窗打开授权链接：noopener 让授权页拿不到 window.opener（防反向跳转劫持），
-// 代价是拿不到 handle，所以「用户是否回来了」靠 visibilitychange 判断。
 function openAuth(slot) {
-  roundFor(slot); // 确保该任务有一份本轮状态（供手动粘贴/读取使用）
   window.open(slot.link, "authclip", "popup=yes,width=560,height=800,noopener");
   // noopener 时返回 null 是正常的，不能用它判断是否被拦。
   // 真弹窗会抢焦点，所以用「500ms 后本页是否还持有焦点」做启发式。
@@ -824,7 +822,6 @@ function openAuth(slot) {
     if (document.hasFocus()) flash("没看到弹窗？用「复制链接」在浏览器里打开也一样。");
   }, 500);
 }
-
 
 // ---------------------------------------------------------------- 接收人视图
 
@@ -855,8 +852,7 @@ function memberCard(slot) {
     );
   }
 
-  // 单一来源：这条任务的「当前轮次」。gen 一变则整份作废，
-  // 表单、自动填入、已打开上下文都跟着失效。
+  // 表单草稿属于当前任务和轮次。
   const round = roundFor(slot);
   // 输入是同步的：写的就是当前这一轮，显式传 round.gen（轮次已变则写入被拒）
   const set = (patch) => {
@@ -968,7 +964,7 @@ function memberCard(slot) {
       }),
       el("button", { type: "button", text: "复制链接", onclick: () => copy(slot.link) }),
     ),
-    el("p", { class: "hint", text: "开在小窗里授权；完成后回到本页，把地址栏整条 URL 粘到下面，或点「读剪贴板并解析」。小窗停在 localhost:54545 打不开是正常的，可以关掉。" }),
+    el("p", { class: "hint", text: "完成后回到对应任务，手动粘贴或点「读剪贴板并解析」。" }),
     el("form", { class: "stack", onsubmit: submit },
       el("label", {}, "回调链接（粘贴整条，自动提取 code）", callback),
       el("div", { class: "row" },
@@ -1119,14 +1115,10 @@ document.querySelector("#home").addEventListener("click", (e) => {
 window.addEventListener("hashchange", () => { stopStream(); void start(); });
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState !== "visible" || !state.token) return;
-  // 切回页面只刷新任务状态，不读剪贴板：
-  // 自动读取会把"浏览器里现有的内容"当成"本次授权结果"，而页面无从判断来源。
   void refresh();
 });
 
 void start();
-
-
 
 
 
