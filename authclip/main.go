@@ -12,10 +12,17 @@ package main
 // 红线：
 //  1. 服务端对授权链接 / 回调链接【零出站请求】。link 与 callback 都只当字符串存。
 //  2. 不记录管理员 IP：admin 路由从不调用 observed()，无访问日志。
-//  3. token 只出现在 URL fragment（#a= / #b=），永不进请求行、不进 Referer、不进反代日志。
+//  3. token 只走请求头；只出现在 URL fragment（#a= / #b=），永不进请求行、不进 Referer、
+//     不进反代日志 —— 服务端不接受 ?t= 之类的查询参数（v1.1 修）。
+//  4. 改派接收人 = 清空该任务已回传的一切数据；回传时在事务内再次校验接收人（v1.1 修）。
+//  5. 回传的 state 必须与当前授权链接里的 state 一致，否则拒收（v1.1 修）。
+//  6. 配置 AUTHCLIP_SECRET 后，令牌与回传数据整体 AES-256-GCM 加密落盘（v1.1 加）。
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base32"
 	"encoding/json"
 	"errors"
@@ -44,9 +51,10 @@ import (
 var webFS embed.FS
 
 const (
-	maxBody   = 128 << 10
-	maxLink   = 8192
-	sessionEC = 20 * time.Second
+	maxBody    = 128 << 10
+	maxLink    = 8192
+	sessionEC  = 20 * time.Second
+	appVersion = "v1.1.0" // v1.1.0: 修改派泄露 / state 归属校验 / 查询参数令牌 / 静态加密
 )
 
 // ---------------------------------------------------------------- 模型
@@ -94,27 +102,61 @@ type data struct {
 // ---------------------------------------------------------------- 存储
 
 type store struct {
-	mu    sync.Mutex
-	path  string
-	d     data
-	subs  map[string]map[chan struct{}]struct{}
-	geoOn bool
+	mu   sync.Mutex
+	path string
+	key  []byte // 非空则落盘为 AES-256-GCM 密文（state.bin）
+	d    data
+	subs map[string]map[chan struct{}]struct{}
 }
 
-func openStore(dir string) (*store, error) {
+// openStore：secret 非空时全量加密落盘（令牌、OAuth 回传数据都不再明文）。
+// 若目录里还有旧的 state.json，会一次性迁移成 state.bin 并删除明文。
+func openStore(dir, secret string) (*store, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	s := &store{path: filepath.Join(dir, "state.json"), subs: map[string]map[chan struct{}]struct{}{}}
+	s := &store{subs: map[string]map[chan struct{}]struct{}{}}
+	plain := filepath.Join(dir, "state.json")
+	if secret != "" {
+		sum := sha256.Sum256([]byte(secret))
+		s.key = sum[:]
+		s.path = filepath.Join(dir, "state.bin")
+	} else {
+		s.path = plain
+	}
+
 	raw, err := os.ReadFile(s.path)
-	if err != nil {
-		if !errors.Is(err, os.ErrNotExist) {
-			return nil, err
+	if err == nil {
+		if s.key != nil {
+			raw, err = decrypt(s.key, raw)
+			if err != nil {
+				return nil, fmt.Errorf("解密 %s 失败（secret 不匹配？）: %w", s.path, err)
+			}
+		}
+		if err := json.Unmarshal(raw, &s.d); err != nil {
+			return nil, fmt.Errorf("解析 %s: %w", s.path, err)
 		}
 		return s, nil
 	}
-	if err := json.Unmarshal(raw, &s.d); err != nil {
-		return nil, fmt.Errorf("解析 %s: %w", s.path, err)
+	if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+
+	// 迁移：有 secret 但只有旧的明文文件
+	if s.key != nil {
+		if old, err := os.ReadFile(plain); err == nil {
+			if err := json.Unmarshal(old, &s.d); err != nil {
+				return nil, fmt.Errorf("解析 %s: %w", plain, err)
+			}
+			s.mu.Lock()
+			saveErr := s.saveLocked()
+			s.mu.Unlock()
+			if saveErr != nil {
+				return nil, saveErr
+			}
+			_ = os.Remove(plain)
+			return s, nil
+		}
 	}
 	return s, nil
 }
@@ -124,11 +166,48 @@ func (s *store) saveLocked() error {
 	if err != nil {
 		return err
 	}
+	if s.key != nil {
+		if raw, err = encrypt(s.key, raw); err != nil {
+			return err
+		}
+	}
 	tmp := s.path + ".tmp"
 	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
 		return err
 	}
 	return os.Rename(tmp, s.path)
+}
+
+func encrypt(key, plain []byte) ([]byte, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, err
+	}
+	return gcm.Seal(nonce, nonce, plain, nil), nil
+}
+
+func decrypt(key, blob []byte) ([]byte, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	if len(blob) < gcm.NonceSize() {
+		return nil, errors.New("密文长度不足")
+	}
+	nonce, body := blob[:gcm.NonceSize()], blob[gcm.NonceSize():]
+	return gcm.Open(nil, nonce, body, nil)
 }
 
 func (s *store) notifyLocked(ch string) {
@@ -338,11 +417,17 @@ func main() {
 	trust := flag.String("trust-proxy", "", "可信反代 CIDR（可选）")
 	geoURL := flag.String("geo-url", "", "客户端地域查询端点（可选，例如 https://ip.net.coffee/ ）")
 	base := flag.String("base", "", "对外地址前缀，用于打印长期链接，例如 https://clip.example.com")
+	secret := flag.String("secret", os.Getenv("AUTHCLIP_SECRET"), "静态加密口令；设置后 state 以 AES-256-GCM 落盘（建议用 AUTHCLIP_SECRET 环境变量）")
 	flag.Parse()
 
-	st, err := openStore(*dir)
+	st, err := openStore(*dir, strings.TrimSpace(*secret))
 	if err != nil {
 		log.Fatal(err)
+	}
+	if strings.TrimSpace(*secret) == "" {
+		log.Printf("警告：未设置 AUTHCLIP_SECRET，令牌与 OAuth 回传数据将以明文落盘（仅文件权限 0600 保护）")
+	} else {
+		log.Printf("静态加密已启用（AES-256-GCM）")
 	}
 	a := &app{st: st, geoURL: strings.TrimSpace(*geoURL), baseURL: strings.TrimRight(*base, "/")}
 	for _, c := range strings.Split(*trust, ",") {
@@ -370,6 +455,23 @@ func main() {
 		return
 	}
 
+	handler, err := a.routes()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	srv := &http.Server{
+		Addr:              *addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		ErrorLog:          log.New(io.Discard, "", 0), // 不写客户端地址
+	}
+	log.Printf("AuthClip %s 监听 http://%s", appVersion, *addr)
+	log.Fatal(srv.ListenAndServe())
+}
+
+// routes 单独抽出来，便于测试用 httptest 直接挂上去
+func (a *app) routes() (http.Handler, error) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/config", a.config)
 	mux.HandleFunc("GET /api/me", a.wrap(a.me))
@@ -385,19 +487,11 @@ func main() {
 
 	static, err := fs.Sub(webFS, "web")
 	if err != nil {
-		log.Fatal(err)
+		return nil, err
 	}
 	mux.HandleFunc("GET /favicon.ico", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) })
 	mux.Handle("/", a.static(static))
-
-	srv := &http.Server{
-		Addr:              *addr,
-		Handler:           a.headers(mux),
-		ReadHeaderTimeout: 10 * time.Second,
-		ErrorLog:          log.New(io.Discard, "", 0), // 不写客户端地址
-	}
-	log.Printf("AuthClip 监听 http://%s", *addr)
-	log.Fatal(srv.ListenAndServe())
+	return a.headers(mux), nil
 }
 
 // ---------------------------------------------------------------- CLI
@@ -492,11 +586,9 @@ type handlerFunc func(http.ResponseWriter, *http.Request, *User)
 
 func (a *app) wrap(h handlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		tok := r.Header.Get("X-Token")
-		if tok == "" {
-			tok = r.URL.Query().Get("t")
-		}
-		u := a.st.userByToken(tok)
+		// 只认请求头。历史上曾支持 ?t= 兜底（给 EventSource 用），
+		// 那会让长期令牌落进访问日志/浏览器历史，已移除。
+		u := a.st.userByToken(r.Header.Get("X-Token"))
 		if u == nil {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "链接无效"})
 			return
@@ -661,7 +753,13 @@ func (a *app) patchSlot(w http.ResponseWriter, r *http.Request, u *User) {
 			s.Label = v
 		}
 		if body.Member != nil {
-			s.Member = strings.TrimSpace(*body.Member)
+			next := strings.TrimSpace(*body.Member)
+			// 改派 = 换人：旧接收人的凭证/邮箱/IP 一律抹掉，
+			// 否则新接收人一打开自己的长期链接就能读到上一位的数据。
+			if next != s.Member {
+				s.Member = next
+				clearReturned(s)
+			}
 		}
 		if body.NodeIP != nil {
 			s.NodeIP = strings.TrimSpace(*body.NodeIP)
@@ -687,10 +785,7 @@ func (a *app) clearSlot(w http.ResponseWriter, r *http.Request, u *User) {
 		return
 	}
 	sl, err := a.st.updateSlot(r.PathValue("id"), func(s *Slot) error {
-		s.Email, s.Code, s.Callback, s.StateParam = "", "", "", ""
-		s.RegIP, s.RegRegion, s.NodeIP = "", "", ""
-		s.SeenIP, s.SeenRegion = "", ""
-		s.Submitted = time.Time{}
+		clearReturned(s)
 		return nil
 	})
 	if err != nil {
@@ -698,6 +793,14 @@ func (a *app) clearSlot(w http.ResponseWriter, r *http.Request, u *User) {
 		return
 	}
 	writeJSON(w, http.StatusOK, sl)
+}
+
+// clearReturned 清空一条任务里由接收人回传/由服务端观测到的全部数据
+func clearReturned(s *Slot) {
+	s.Email, s.Code, s.Callback, s.StateParam = "", "", "", ""
+	s.RegIP, s.RegRegion, s.NodeIP = "", "", ""
+	s.SeenIP, s.SeenRegion = "", ""
+	s.Submitted = time.Time{}
 }
 
 func (a *app) deleteSlot(w http.ResponseWriter, r *http.Request, u *User) {
@@ -803,10 +906,38 @@ func (a *app) report(w http.ResponseWriter, r *http.Request, u *User) {
 		node = ip.Unmap().String()
 	}
 
+	// 服务端核对 OAuth 归属：回调里的 state 必须与当前授权链接里的 state 一致。
+	// 否则任何人都能把别处的 code 塞进这条任务（或任务被改派后继续用旧链接的回传）。
+	if want := linkStateOf(sl.Link); want != "" {
+		switch {
+		case stateParam == "":
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error": "需要整条回调链接：其中必须带 state（服务端要核对归属）",
+			})
+			return
+		case stateParam != want:
+			writeJSON(w, http.StatusConflict, map[string]string{
+				"error": "回调的 state 与当前授权链接不一致，可能拿错了链接（或该任务已改派/换过链接）",
+			})
+			return
+		}
+	}
+
 	observed := a.observed(r)
 	seenRegion := a.country(observed)
 
+	var denied bool
 	updated, err := a.st.updateSlot(sl.ID, func(s *Slot) error {
+		// 事务内再校验一次接收人：读与写之间可能刚被改派
+		if s.Member != u.ID {
+			denied = true
+			return errors.New("reassigned")
+		}
+		// 链接在提交期间被换掉，也要按新链接的 state 再核一次
+		if want := linkStateOf(s.Link); want != "" && stateParam != want {
+			denied = true
+			return errors.New("link changed")
+		}
 		s.Email, s.Code, s.Callback, s.StateParam = email, code, callback, stateParam
 		s.NodeIP = node
 		s.RegIP = regIP
@@ -821,6 +952,12 @@ func (a *app) report(w http.ResponseWriter, r *http.Request, u *User) {
 		s.Submitted = time.Now().UTC()
 		return nil
 	})
+	if denied {
+		writeJSON(w, http.StatusConflict, map[string]string{
+			"error": "任务在提交期间发生变化（已改派或已换链接），请刷新后重试",
+		})
+		return
+	}
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "保存失败"})
 		return
@@ -913,6 +1050,15 @@ func (a *app) country(ip netip.Addr) string {
 }
 
 // ---------------------------------------------------------------- 解析与校验
+
+// linkStateOf 取授权链接里的 state（OAuth 绑定的一次性随机串），只做字符串解析
+func linkStateOf(link string) string {
+	u, err := url.Parse(strings.TrimSpace(link))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(u.Query().Get("state"))
+}
 
 // parseCallback 从「整条回调链接」或「code=…&state=…」里切出 code 与 state。
 // 只做字符串解析，不发起任何请求。

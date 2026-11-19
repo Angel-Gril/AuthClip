@@ -161,3 +161,72 @@ clip.example.com {
 | B 端（手机） | ![B-m](docs/member-mobile.png) |
 
 长期链接在界面上默认打码（点「显示」才展开），避免截屏/投屏时把 token 带出去。
+
+## 十、v1.1.0 安全修复（针对上线前审查的三条阻断项）
+
+审查对象：`authclip` 分支 `1578c8f`。三条均**复现于源码**，非误报。
+
+### 1. 改派接收人泄露上一位的数据（已修）
+
+- **问题**：`PATCH /api/slots/{id}` 换 `member` 时只改 `Member` 字段，旧 `code/callback/email/reg_ip/node_ip/seen_ip` 全部留在任务里；新接收人通过自己的 `/api/mine` 直接读到。且 `report` 的归属校验在事务外，改派并发时不会重新校验。
+- **修复**：改派即调用 `clearReturned()` 抹掉全部回传与观测字段；`report` 在 `updateSlot` 闭包内**再校验一次** `s.Member == 用户`，不匹配返回 409「任务在提交期间发生变化」。
+- **测试**：`TestReassignClearsReturnedData`、`TestReportAfterReassignRejected`。
+
+### 2. 回传未与授权链接的 state 核对（已修）
+
+- **问题**：只保存回传的 `state`，从不比对当前授权链接里的 `state`。任何人都能把别处的 code 塞进这条任务；任务换链接后旧回传也不会失效。
+- **修复**：`linkStateOf(link)` 取授权链接的 `state`；回传时——
+  - 链接有 state 而回传没有 → `400`「需要整条回调链接：其中必须带 state」
+  - 两者不一致 → `409`「state 与当前授权链接不一致」
+  - 事务内按**最新链接**再核一次（提交期间被换链接也会拒）
+- **测试**：`TestReportRejectsForeignState`、`TestLinkStateParsing`。
+
+### 3. 长期令牌可经 URL 查询参数泄露（已修）
+
+- **问题**：`wrap()` 里 `?t=` 兜底（早先给 EventSource 用）——令牌会进访问日志、浏览器历史、反代日志。
+- **修复**：只认 `X-Token` 请求头；前端本就改用 `fetch` 流式读 SSE，无需查询串。
+- **静态存储**：设置 `AUTHCLIP_SECRET` 后，整个状态文件以 **AES-256-GCM** 落盘为 `state.bin`（令牌 + OAuth 回传数据一起加密），旧的 `state.json` 会自动迁移并删除；未设置时启动日志会明确警告。
+- **测试**：`TestTokenFromQueryRejected`、`TestStoreEncryptionAtRest`。
+
+### 实测输出（`scripts/verify-fixes.ps1`）
+
+```
+state 不一致        -> 409
+缺 state            -> 400
+state 一致          -> 200
+改派后 B2 看到: email='' code='' callback='' reg_ip='' node=''
+被改派者 B1 再回传  -> 404
+查询参数 ?t=        -> 401        请求头 X-Token -> 200
+state.bin 中出现 admin token 明文: False      state.json 存在: False
+```
+
+## 十一、Go 版本与漏洞公告
+
+**构建要求：Go ≥ 1.27.4**（`go.mod` 已钉 `go 1.27.4`）。`go1.27.0~1.27.3` 的标准库带 15 条公告，
+其中 7 条在本服务可达（`net/http` 服务端、`os.MkdirAll`、`http.MaxBytesReader` 等）。
+
+| 公告 | 修复于 | 影响本服务 | 说明 |
+| :--- | :--- | :--- | :--- |
+| **GO-2026-6859** | **1.27.4** | **是** | `net/http` MaxBytesReader header race 导致 HTTP/1 服务端崩溃；本服务在 `decode()` 里直接用它 |
+| GO-2026-6609 | 1.27.2 | 是 | Range 头无长度上限；`http.FileServer` 提供静态资源 |
+| GO-2026-6603 | 1.27.2 | 否（不启 h2） | HTTP/2 Trailer 内存耗尽；Caddy 终结 TLS，后端只跑 HTTP/1.1 |
+| GO-2026-6610 / 6611 / 6612 / 6617 | 1.27.2 | 否（不启 h2） | HTTP/2 分帧、流控、HPACK 竞争 |
+| GO-2026-6613 | 1.27.2 | 否 | HTTP/1 服务端 CONNECT 失步；未接受 CONNECT |
+| GO-2026-6605 | 1.27.2 | 否 | HTTP/1 **客户端** CONNECT；本服务无出站请求 |
+| GO-2026-6604 | 1.27.2 | 是（仅 Windows） | `os.MkdirAll` 可跟随 junction；`openStore` 会建目录 |
+| GO-2026-6608 | 1.27.2 | 否 | MIME 头解析；不处理 multipart |
+| GO-2026-6607 | 1.27.2 | 否 | crypto/tls ECH；不做 TLS 终结 |
+| GO-2026-6599 / 6600 | 1.27.2 | 否 | html/template / regexp；未使用 html/template |
+| GO-2026-6809 | 1.27.3 | 否 | crypto/x509 中间证书；无出站 TLS 校验证书 |
+
+验证方式与结果：
+
+```text
+OSV stdlib@1.27.0 → 15 条（含 GO-2026-6859）
+OSV stdlib@1.27.4 → none
+govulncheck ./...（go1.27.4 构建）→ No vulnerabilities found
+go version -m authclip.exe → go1.27.4
+```
+
+> 注意：`govulncheck` 按**实际构建用的工具链**判定。审查环境若用 1.27.0~1.27.3 编译，
+> 即使 `go.mod` 写 1.27.4 也会命中；CI 需确认 `go version` 输出。
