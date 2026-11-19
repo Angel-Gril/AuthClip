@@ -1,0 +1,1007 @@
+package main
+
+// AuthClip v2 —— 长期链接版
+//
+// 形态（按实际流程）：
+//   A 有一条长期链接  https://host/#a=<token>   —— 不登录，打开就是看板
+//   B 有一条长期链接  https://host/#b=<token>   —— 不登录，打开就是"我的授权"
+//   A 把 Claude 授权链接丢进某个 B 的收件箱；B 点开走官方 OAuth；
+//   B 回来后把地址栏那条 http://localhost:54545/callback?code=…&state=… 整条粘进来，
+//   页面自动切出 code / state，连同注册邮箱、注册地区、注册 IP、静态家宽节点一起回传。
+//
+// 红线：
+//  1. 服务端对授权链接 / 回调链接【零出站请求】。link 与 callback 都只当字符串存。
+//  2. 不记录管理员 IP：admin 路由从不调用 observed()，无访问日志。
+//  3. token 只出现在 URL fragment（#a= / #b=），永不进请求行、不进 Referer、不进反代日志。
+
+import (
+	"crypto/rand"
+	"encoding/base32"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"io/fs"
+	"log"
+	"net/http"
+	"net/mail"
+	"net/netip"
+	"net/url"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"embed"
+
+	maxminddb "github.com/oschwald/maxminddb-golang/v2"
+)
+
+//go:embed web
+var webFS embed.FS
+
+const (
+	maxBody   = 128 << 10
+	maxLink   = 8192
+	sessionEC = 20 * time.Second
+)
+
+// ---------------------------------------------------------------- 模型
+
+type User struct {
+	ID      string    `json:"id"`
+	Role    string    `json:"role"` // admin | member
+	Label   string    `json:"label"`
+	Token   string    `json:"token"`
+	Created time.Time `json:"created"`
+}
+
+type Slot struct {
+	ID      string    `json:"id"`
+	Owner   string    `json:"owner"`  // admin id
+	Member  string    `json:"member"` // member id
+	Label   string    `json:"label"`
+	Link    string    `json:"link"`
+	Created time.Time `json:"created"`
+	Updated time.Time `json:"updated"`
+	Rev     int       `json:"rev"`
+
+	// B 回传
+	Email      string    `json:"email"`
+	Code       string    `json:"code"`
+	Callback   string    `json:"callback"`
+	StateParam string    `json:"state_param"`
+	RegIP      string    `json:"reg_ip"`
+	RegRegion  string    `json:"reg_region"`
+	NodeIP     string    `json:"node_ip"`
+	Submitted  time.Time `json:"submitted"`
+
+	// 服务端观测（仅 member 提交时写入）
+	SeenIP     string `json:"seen_ip"`
+	SeenRegion string `json:"seen_region"`
+}
+
+func (s *Slot) filled() bool { return s.Code != "" || s.Email != "" }
+
+type data struct {
+	Users []*User `json:"users"`
+	Slots []*Slot `json:"slots"`
+}
+
+// ---------------------------------------------------------------- 存储
+
+type store struct {
+	mu    sync.Mutex
+	path  string
+	d     data
+	subs  map[string]map[chan struct{}]struct{}
+	geoOn bool
+}
+
+func openStore(dir string) (*store, error) {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, err
+	}
+	s := &store{path: filepath.Join(dir, "state.json"), subs: map[string]map[chan struct{}]struct{}{}}
+	raw, err := os.ReadFile(s.path)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+		return s, nil
+	}
+	if err := json.Unmarshal(raw, &s.d); err != nil {
+		return nil, fmt.Errorf("解析 %s: %w", s.path, err)
+	}
+	return s, nil
+}
+
+func (s *store) saveLocked() error {
+	raw, err := json.MarshalIndent(s.d, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := s.path + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, s.path)
+}
+
+func (s *store) notifyLocked(ch string) {
+	for c := range s.subs[ch] {
+		select {
+		case c <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (s *store) subscribe(ch string) chan struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	c := make(chan struct{}, 1)
+	if s.subs[ch] == nil {
+		s.subs[ch] = map[chan struct{}]struct{}{}
+	}
+	s.subs[ch][c] = struct{}{}
+	return c
+}
+
+func (s *store) unsubscribe(ch string, c chan struct{}) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if m := s.subs[ch]; m != nil {
+		delete(m, c)
+		if len(m) == 0 {
+			delete(s.subs, ch)
+		}
+	}
+}
+
+func newToken() string {
+	b := make([]byte, 20)
+	if _, err := rand.Read(b); err != nil {
+		panic(err)
+	}
+	return strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(b))
+}
+
+func (s *store) addUser(role, label string) (*User, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u := &User{ID: newToken()[:10], Role: role, Label: label, Token: newToken(), Created: time.Now().UTC()}
+	s.d.Users = append(s.d.Users, u)
+	if err := s.saveLocked(); err != nil {
+		s.d.Users = s.d.Users[:len(s.d.Users)-1]
+		return nil, err
+	}
+	cp := *u
+	s.notifyLocked("admin")
+	return &cp, nil
+}
+
+func (s *store) userByToken(tok string) *User {
+	if tok == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, u := range s.d.Users {
+		if u.Token == tok {
+			cp := *u
+			return &cp
+		}
+	}
+	return nil
+}
+
+func (s *store) userByID(id string) *User {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, u := range s.d.Users {
+		if u.ID == id {
+			cp := *u
+			return &cp
+		}
+	}
+	return nil
+}
+
+func (s *store) users() []User {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]User, 0, len(s.d.Users))
+	for _, u := range s.d.Users {
+		out = append(out, *u)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Created.Before(out[j].Created) })
+	return out
+}
+
+func (s *store) createSlot(owner, member, label, link string) (*Slot, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now().UTC()
+	sl := &Slot{
+		ID: newToken()[:10], Owner: owner, Member: member, Label: label, Link: link,
+		Created: now, Updated: now, Rev: 1,
+	}
+	s.d.Slots = append(s.d.Slots, sl)
+	if err := s.saveLocked(); err != nil {
+		s.d.Slots = s.d.Slots[:len(s.d.Slots)-1]
+		return nil, err
+	}
+	cp := *sl
+	s.notifyLocked("admin")
+	s.notifyLocked("u:" + member)
+	return &cp, nil
+}
+
+func (s *store) slotsFor(memberID string) []Slot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []Slot
+	for _, v := range s.d.Slots {
+		if v.Member == memberID {
+			out = append(out, *v)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Created.After(out[j].Created) })
+	return out
+}
+
+func (s *store) allSlots() []Slot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]Slot, 0, len(s.d.Slots))
+	for i := len(s.d.Slots) - 1; i >= 0; i-- {
+		out = append(out, *s.d.Slots[i])
+	}
+	return out
+}
+
+func (s *store) slotByID(id string) *Slot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, v := range s.d.Slots {
+		if v.ID == id {
+			cp := *v
+			return &cp
+		}
+	}
+	return nil
+}
+
+func (s *store) updateSlot(id string, fn func(*Slot) error) (*Slot, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, v := range s.d.Slots {
+		if v.ID != id {
+			continue
+		}
+		prev := *v
+		if err := fn(v); err != nil {
+			*v = prev
+			return nil, err
+		}
+		v.Updated = time.Now().UTC()
+		v.Rev++
+		if err := s.saveLocked(); err != nil {
+			*v = prev
+			return nil, err
+		}
+		cp := *v
+		s.notifyLocked("admin")
+		s.notifyLocked("u:" + v.Member)
+		return &cp, nil
+	}
+	return nil, os.ErrNotExist
+}
+
+func (s *store) removeSlot(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i, v := range s.d.Slots {
+		if v.ID != id {
+			continue
+		}
+		m := v.Member
+		s.d.Slots = append(s.d.Slots[:i], s.d.Slots[i+1:]...)
+		if err := s.saveLocked(); err != nil {
+			return err
+		}
+		s.notifyLocked("admin")
+		s.notifyLocked("u:" + m)
+		return nil
+	}
+	return os.ErrNotExist
+}
+
+// ---------------------------------------------------------------- 应用
+
+type app struct {
+	st       *store
+	geo      *maxminddb.Reader
+	trusted  []netip.Prefix
+	geoURL   string
+	baseURL  string
+}
+
+func main() {
+	addr := flag.String("http", "127.0.0.1:8090", "监听地址")
+	dir := flag.String("dir", "data", "数据目录")
+	geoPath := flag.String("geo", "", "MMDB 国家库（可选）")
+	trust := flag.String("trust-proxy", "", "可信反代 CIDR（可选）")
+	geoURL := flag.String("geo-url", "", "客户端地域查询端点（可选，例如 https://ip.net.coffee/ ）")
+	base := flag.String("base", "", "对外地址前缀，用于打印长期链接，例如 https://clip.example.com")
+	flag.Parse()
+
+	st, err := openStore(*dir)
+	if err != nil {
+		log.Fatal(err)
+	}
+	a := &app{st: st, geoURL: strings.TrimSpace(*geoURL), baseURL: strings.TrimRight(*base, "/")}
+	for _, c := range strings.Split(*trust, ",") {
+		if c = strings.TrimSpace(c); c != "" {
+			p, err := netip.ParsePrefix(c)
+			if err != nil {
+				log.Fatalf("trust-proxy 非法 CIDR %q: %v", c, err)
+			}
+			a.trusted = append(a.trusted, p.Masked())
+		}
+	}
+	if *geoPath != "" {
+		r, err := maxminddb.Open(*geoPath)
+		if err != nil {
+			log.Fatalf("打开 MMDB 失败: %v", err)
+		}
+		a.geo = r
+		defer func() { _ = r.Close() }()
+	}
+
+	// 子命令：users / add
+	args := flag.Args()
+	if len(args) > 0 {
+		a.cli(args)
+		return
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/config", a.config)
+	mux.HandleFunc("GET /api/me", a.wrap(a.me))
+	mux.HandleFunc("GET /api/board", a.wrap(a.board))
+	mux.HandleFunc("POST /api/members", a.wrap(a.addMember))
+	mux.HandleFunc("POST /api/slots", a.wrap(a.createSlot))
+	mux.HandleFunc("PATCH /api/slots/{id}", a.wrap(a.patchSlot))
+	mux.HandleFunc("POST /api/slots/{id}/clear", a.wrap(a.clearSlot))
+	mux.HandleFunc("DELETE /api/slots/{id}", a.wrap(a.deleteSlot))
+	mux.HandleFunc("GET /api/mine", a.wrap(a.mine))
+	mux.HandleFunc("POST /api/slots/{id}/report", a.wrap(a.report))
+	mux.HandleFunc("GET /api/stream", a.wrap(a.stream))
+
+	static, err := fs.Sub(webFS, "web")
+	if err != nil {
+		log.Fatal(err)
+	}
+	mux.HandleFunc("GET /favicon.ico", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) })
+	mux.Handle("/", a.static(static))
+
+	srv := &http.Server{
+		Addr:              *addr,
+		Handler:           a.headers(mux),
+		ReadHeaderTimeout: 10 * time.Second,
+		ErrorLog:          log.New(io.Discard, "", 0), // 不写客户端地址
+	}
+	log.Printf("AuthClip 监听 http://%s", *addr)
+	log.Fatal(srv.ListenAndServe())
+}
+
+// ---------------------------------------------------------------- CLI
+
+func (a *app) cli(args []string) {
+	switch args[0] {
+	case "users":
+		for _, u := range a.st.users() {
+			fmt.Printf("%-6s %-10s %s\n", u.Role, u.ID, u.Label)
+		}
+	case "add":
+		if len(args) < 3 || (args[1] != "admin" && args[1] != "member") {
+			fmt.Println("用法: authclip add admin|member 标签")
+			os.Exit(2)
+		}
+		u, err := a.st.addUser(args[1], strings.Join(args[2:], " "))
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Printf("已创建 %s「%s」\n长期链接: %s\n", u.Role, u.Label, a.linkFor(u))
+	case "link":
+		if len(args) < 3 {
+			fmt.Println("用法: authclip link admin|member 标签")
+			os.Exit(2)
+		}
+		for _, u := range a.st.users() {
+			if u.Role == args[1] && u.Label == strings.Join(args[2:], " ") {
+				fmt.Println(a.linkFor(&u))
+				return
+			}
+		}
+		fmt.Println("没找到该用户")
+		os.Exit(1)
+	default:
+		fmt.Println("子命令: users | add | link")
+	}
+}
+
+func (a *app) linkFor(u *User) string {
+	prefix := a.baseURL
+	if prefix == "" {
+		prefix = "http://127.0.0.1:8090"
+	}
+	if u.Role == "admin" {
+		return prefix + "/#a=" + u.Token
+	}
+	return prefix + "/#b=" + u.Token
+}
+
+// ---------------------------------------------------------------- 中间件
+
+func (a *app) headers(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("Referrer-Policy", "no-referrer")
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("X-Robots-Tag", "noindex, nofollow, noarchive")
+		h.Set("Cross-Origin-Opener-Policy", "same-origin")
+		h.Set("Cache-Control", "no-store")
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (a *app) static(root fs.FS) http.Handler {
+	files := http.FileServer(http.FS(root))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/api/") {
+			conn := "connect-src 'self'"
+			if origin := originOf(a.geoURL); origin != "" {
+				conn += " " + origin
+			}
+			w.Header().Set("Content-Security-Policy",
+				"default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; "+
+					conn+"; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
+		}
+		files.ServeHTTP(w, r)
+	})
+}
+
+func originOf(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return ""
+	}
+	return u.Scheme + "://" + u.Host
+}
+
+type handlerFunc func(http.ResponseWriter, *http.Request, *User)
+
+func (a *app) wrap(h handlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		tok := r.Header.Get("X-Token")
+		if tok == "" {
+			tok = r.URL.Query().Get("t")
+		}
+		u := a.st.userByToken(tok)
+		if u == nil {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "链接无效"})
+			return
+		}
+		h(w, r, u)
+	}
+}
+
+// ---------------------------------------------------------------- 接口
+
+func (a *app) config(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]string{"geo_url": a.geoURL})
+}
+
+func (a *app) me(w http.ResponseWriter, r *http.Request, u *User) {
+	writeJSON(w, http.StatusOK, map[string]string{"id": u.ID, "role": u.Role, "label": u.Label})
+}
+
+func (a *app) board(w http.ResponseWriter, r *http.Request, u *User) {
+	if u.Role != "admin" {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "仅管理员"})
+		return
+	}
+	members := []map[string]any{}
+	for _, m := range a.st.users() {
+		if m.Role != "member" {
+			continue
+		}
+		members = append(members, map[string]any{
+			"id": m.ID, "label": m.Label, "token": m.Token,
+			"link": a.linkFor(&m), "created": m.Created,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"members": members, "slots": a.st.allSlots()})
+}
+
+func (a *app) addMember(w http.ResponseWriter, r *http.Request, u *User) {
+	if u.Role != "admin" {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "仅管理员"})
+		return
+	}
+	var body struct {
+		Label string `json:"label"`
+	}
+	if err := decode(w, r, &body); err != nil {
+		return
+	}
+	label := strings.TrimSpace(body.Label)
+	if label == "" {
+		label = "未命名接收人"
+	}
+	if len(label) > 40 {
+		label = label[:40]
+	}
+	m, err := a.st.addUser("member", label)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "写入失败"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id": m.ID, "label": m.Label, "token": m.Token, "link": a.linkFor(m),
+	})
+}
+
+func (a *app) createSlot(w http.ResponseWriter, r *http.Request, u *User) {
+	if u.Role != "admin" {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "仅管理员"})
+		return
+	}
+	var body struct {
+		Member string `json:"member"`
+		Link   string `json:"link"`
+		Label  string `json:"label"`
+	}
+	if err := decode(w, r, &body); err != nil {
+		return
+	}
+	m := a.st.userByID(strings.TrimSpace(body.Member))
+	if m == nil || m.Role != "member" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "接收人不存在"})
+		return
+	}
+	link := strings.TrimSpace(body.Link)
+	if link == "" || len(link) > maxLink || !plausibleURL(link) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "授权链接格式不正确"})
+		return
+	}
+	label := strings.TrimSpace(body.Label)
+	if len(label) > 60 {
+		label = label[:60]
+	}
+	sl, err := a.st.createSlot(u.ID, m.ID, label, link)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "写入失败"})
+		return
+	}
+	writeJSON(w, http.StatusOK, sl)
+}
+
+func (a *app) patchSlot(w http.ResponseWriter, r *http.Request, u *User) {
+	if u.Role != "admin" {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "仅管理员"})
+		return
+	}
+	var body struct {
+		Link   *string `json:"link"`
+		Label  *string `json:"label"`
+		Member *string `json:"member"`
+		NodeIP *string `json:"node_ip"`
+		Region *string `json:"region"`
+		Email  *string `json:"email"`
+	}
+	if err := decode(w, r, &body); err != nil {
+		return
+	}
+	if body.Link != nil {
+		v := strings.TrimSpace(*body.Link)
+		if v == "" || len(v) > maxLink || !plausibleURL(v) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "授权链接格式不正确"})
+			return
+		}
+	}
+	if body.Member != nil {
+		m := a.st.userByID(strings.TrimSpace(*body.Member))
+		if m == nil || m.Role != "member" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "接收人不存在"})
+			return
+		}
+	}
+	if body.NodeIP != nil {
+		v := strings.TrimSpace(*body.NodeIP)
+		if v != "" {
+			if _, err := netip.ParseAddr(v); err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "节点 IP 格式不正确"})
+				return
+			}
+		}
+	}
+	if body.Region != nil {
+		v := strings.ToUpper(strings.TrimSpace(*body.Region))
+		if v != "" && !validRegion(v) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "地区请填两位国家代码"})
+			return
+		}
+	}
+	if body.Email != nil {
+		v := strings.TrimSpace(*body.Email)
+		if v != "" && !validEmail(v) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "邮箱格式不正确"})
+			return
+		}
+	}
+	sl, err := a.st.updateSlot(r.PathValue("id"), func(s *Slot) error {
+		if body.Link != nil {
+			s.Link = strings.TrimSpace(*body.Link)
+		}
+		if body.Label != nil {
+			v := strings.TrimSpace(*body.Label)
+			if len(v) > 60 {
+				v = v[:60]
+			}
+			s.Label = v
+		}
+		if body.Member != nil {
+			s.Member = strings.TrimSpace(*body.Member)
+		}
+		if body.NodeIP != nil {
+			s.NodeIP = strings.TrimSpace(*body.NodeIP)
+		}
+		if body.Region != nil {
+			s.RegRegion = strings.ToUpper(strings.TrimSpace(*body.Region))
+		}
+		if body.Email != nil {
+			s.Email = strings.TrimSpace(*body.Email)
+		}
+		return nil
+	})
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "槽位不存在"})
+		return
+	}
+	writeJSON(w, http.StatusOK, sl)
+}
+
+func (a *app) clearSlot(w http.ResponseWriter, r *http.Request, u *User) {
+	if u.Role != "admin" {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "仅管理员"})
+		return
+	}
+	sl, err := a.st.updateSlot(r.PathValue("id"), func(s *Slot) error {
+		s.Email, s.Code, s.Callback, s.StateParam = "", "", "", ""
+		s.RegIP, s.RegRegion, s.NodeIP = "", "", ""
+		s.SeenIP, s.SeenRegion = "", ""
+		s.Submitted = time.Time{}
+		return nil
+	})
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "槽位不存在"})
+		return
+	}
+	writeJSON(w, http.StatusOK, sl)
+}
+
+func (a *app) deleteSlot(w http.ResponseWriter, r *http.Request, u *User) {
+	if u.Role != "admin" {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "仅管理员"})
+		return
+	}
+	if err := a.st.removeSlot(r.PathValue("id")); err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "槽位不存在"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (a *app) mine(w http.ResponseWriter, r *http.Request, u *User) {
+	if u.Role != "member" {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "请用接收人链接打开"})
+		return
+	}
+	ip := a.observed(r) // 仅 member 路径
+	writeJSON(w, http.StatusOK, map[string]any{
+		"role": "member", "label": u.Label,
+		"slots": a.st.slotsFor(u.ID),
+		"seen":  map[string]string{"ip": ipText(ip), "region": a.country(ip)},
+	})
+}
+
+func (a *app) report(w http.ResponseWriter, r *http.Request, u *User) {
+	if u.Role != "member" {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "仅接收人可回传"})
+		return
+	}
+	sl := a.st.slotByID(r.PathValue("id"))
+	if sl == nil || sl.Member != u.ID {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "任务不存在"})
+		return
+	}
+	var body struct {
+		Email     string `json:"email"`
+		Code      string `json:"code"`
+		Callback  string `json:"callback"`
+		RegIP     string `json:"reg_ip"`
+		RegRegion string `json:"reg_region"`
+		NodeIP    string `json:"node_ip"`
+	}
+	if err := decode(w, r, &body); err != nil {
+		return
+	}
+	email := strings.TrimSpace(body.Email)
+	callback := strings.TrimSpace(body.Callback)
+	code := strings.TrimSpace(body.Code)
+	stateParam := ""
+
+	// 允许把整条回调链接塞进 code 框或 callback 框，服务端兜底解析
+	for _, raw := range []string{callback, code} {
+		if c, st, ok := parseCallback(raw); ok {
+			if code == "" {
+				code = c
+			}
+			if stateParam == "" {
+				stateParam = st
+			}
+			if callback == "" && strings.Contains(raw, "?") {
+				callback = raw
+			}
+		}
+	}
+
+	regIP := strings.TrimSpace(body.RegIP)
+	regRegion := strings.ToUpper(strings.TrimSpace(body.RegRegion))
+	node := strings.TrimSpace(body.NodeIP)
+
+	if email == "" || !validEmail(email) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "注册邮箱不正确"})
+		return
+	}
+	if code == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "没有识别到凭证：请粘贴整条回调链接"})
+		return
+	}
+	if len(code) > 4096 || len(callback) > maxLink {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "内容过长"})
+		return
+	}
+	if regIP != "" {
+		ip, err := netip.ParseAddr(regIP)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "注册 IP 格式不正确"})
+			return
+		}
+		regIP = ip.Unmap().String()
+	}
+	if regRegion != "" && !validRegion(regRegion) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "注册地区请填两位国家代码"})
+		return
+	}
+	if node != "" {
+		ip, err := netip.ParseAddr(node)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "节点 IP 格式不正确"})
+			return
+		}
+		node = ip.Unmap().String()
+	}
+
+	observed := a.observed(r)
+	seenRegion := a.country(observed)
+
+	updated, err := a.st.updateSlot(sl.ID, func(s *Slot) error {
+		s.Email, s.Code, s.Callback, s.StateParam = email, code, callback, stateParam
+		s.NodeIP = node
+		s.RegIP = regIP
+		if s.RegIP == "" {
+			s.RegIP = ipText(observed)
+		}
+		s.RegRegion = regRegion
+		if s.RegRegion == "" {
+			s.RegRegion = seenRegion
+		}
+		s.SeenIP, s.SeenRegion = ipText(observed), seenRegion
+		s.Submitted = time.Now().UTC()
+		return nil
+	})
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "保存失败"})
+		return
+	}
+	writeJSON(w, http.StatusOK, updated)
+}
+
+// ---------------------------------------------------------------- 流
+
+func (a *app) stream(w http.ResponseWriter, r *http.Request, u *User) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "不支持流"})
+		return
+	}
+	ch := "admin"
+	if u.Role == "member" {
+		ch = "u:" + u.ID
+	}
+	sub := a.st.subscribe(ch)
+	defer a.st.unsubscribe(ch, sub)
+
+	h := w.Header()
+	h.Set("Content-Type", "text/event-stream; charset=utf-8")
+	h.Set("Cache-Control", "no-store")
+	h.Set("X-Accel-Buffering", "no")
+	h.Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprint(w, "retry: 2000\n\n")
+	flusher.Flush()
+
+	tick := time.NewTicker(sessionEC)
+	defer tick.Stop()
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-sub:
+			fmt.Fprint(w, "event: change\ndata: {}\n\n")
+			flusher.Flush()
+		case <-tick.C:
+			fmt.Fprint(w, ": ping\n\n")
+			flusher.Flush()
+		}
+	}
+}
+
+// ---------------------------------------------------------------- 网络与地域
+
+func (a *app) observed(r *http.Request) netip.Addr {
+	peer, err := netip.ParseAddrPort(r.RemoteAddr)
+	if err != nil {
+		return netip.Addr{}
+	}
+	ip := peer.Addr().Unmap()
+	for _, p := range a.trusted {
+		if p.Contains(ip) {
+			if fwd, err := netip.ParseAddr(strings.TrimSpace(r.Header.Get("X-Real-IP"))); err == nil {
+				ip = fwd.Unmap()
+			}
+			break
+		}
+	}
+	if !ip.IsValid() || ip.IsLoopback() || ip.IsPrivate() || !ip.IsGlobalUnicast() {
+		return netip.Addr{}
+	}
+	return ip
+}
+
+func ipText(ip netip.Addr) string {
+	if !ip.IsValid() {
+		return ""
+	}
+	return ip.String()
+}
+
+func (a *app) country(ip netip.Addr) string {
+	if a.geo == nil || !ip.IsValid() {
+		return ""
+	}
+	var code string
+	if err := a.geo.Lookup(ip).DecodePath(&code, "country", "iso_code"); err != nil {
+		return ""
+	}
+	code = strings.ToUpper(code)
+	if len(code) != 2 {
+		return ""
+	}
+	return code
+}
+
+// ---------------------------------------------------------------- 解析与校验
+
+// parseCallback 从「整条回调链接」或「code=…&state=…」里切出 code 与 state。
+// 只做字符串解析，不发起任何请求。
+func parseCallback(raw string) (code, state string, ok bool) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return "", "", false
+	}
+	if len(s) > maxLink {
+		s = s[:maxLink]
+	}
+	if u, err := url.Parse(s); err == nil && u.Scheme != "" && u.Host != "" {
+		q := u.Query()
+		// 授权链接本身也带 code=true / code_challenge / response_type，
+		// 必须先排除，否则会把 code=true 当成凭证。
+		if q.Get("code_challenge") != "" || q.Get("response_type") != "" || q.Get("redirect_uri") != "" || q.Get("scope") != "" {
+			return "", "", false
+		}
+		if c := q.Get("code"); plausibleCode(c) {
+			return c, q.Get("state"), true
+		}
+		return "", "", false
+	}
+	if strings.Contains(s, "code=") {
+		if v, err := url.ParseQuery(s); err == nil {
+			if c := v.Get("code"); plausibleCode(c) {
+				return c, v.Get("state"), true
+			}
+		}
+	}
+	return "", "", false
+}
+
+// plausibleCode 排除 OAuth 授权链接里的布尔标记（code=true 之类）
+func plausibleCode(c string) bool {
+	c = strings.TrimSpace(c)
+	switch strings.ToLower(c) {
+	case "", "true", "false", "1", "0":
+		return false
+	}
+	return true
+}
+
+func decode(w http.ResponseWriter, r *http.Request, dst any) error {
+	body := http.MaxBytesReader(w, r.Body, maxBody)
+	dec := json.NewDecoder(body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求体不正确"})
+		return err
+	}
+	return nil
+}
+
+func writeJSON(w http.ResponseWriter, code int, v any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func validEmail(s string) bool {
+	if len(s) > 254 {
+		return false
+	}
+	p, err := mail.ParseAddress(s)
+	return err == nil && p.Address == s
+}
+
+func validRegion(v string) bool {
+	if len(v) != 2 {
+		return false
+	}
+	for i := 0; i < 2; i++ {
+		if v[i] < 'A' || v[i] > 'Z' {
+			return false
+		}
+	}
+	return true
+}
+
+// plausibleURL 只做字面校验，绝不请求
+func plausibleURL(s string) bool {
+	if !strings.HasPrefix(s, "https://") && !strings.HasPrefix(s, "http://") {
+		return false
+	}
+	rest := strings.TrimPrefix(strings.TrimPrefix(s, "https://"), "http://")
+	host := rest
+	if i := strings.IndexAny(rest, "/?#"); i >= 0 {
+		host = rest[:i]
+	}
+	return host != "" && !strings.ContainsAny(host, " \t\r\n")
+}
