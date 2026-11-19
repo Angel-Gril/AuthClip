@@ -327,3 +327,51 @@ PASS TestPurgeOnlyForAllScope        彻底删除需 all；own 访问他人任�
 PASS TestOwnScopeCannotCreateMember  own 建接收人 403，all 正常
 PASS TestExportCSV                   导出含已归档行与表头；own 导出 403
 ```
+
+## 十四、v1.3.1 安全修复（针对 5498aea 审查）
+
+审查对象 `5498aea`。三条均复现于源码。
+
+### 1. 账号列表暴露长期令牌
+
+- **问题**：`GET /api/users` 直接序列化 `[]User`，`Token` 字段一并返回；`/api/board` 的接收人列表也带 `token/link`。任何 `all` 管理员（或拿到其链接的人）可批量导出所有人的身份凭证。
+- **修复**：两个列表都改成投影，**不含 token/link**。要发链接只有一条路：`POST /api/users/{id}/rotate` —— 签发新链接（旧链接同时失效），只显示一次，并记 `user.rotate` 审计。
+- **代价**：A 端不能再"查看已有链接"，只能"重新生成"。界面已改成「重新生成链接」。
+
+### 2. OAuth 回传校验缺口
+
+- **问题**：`linkStateOf(link)` 为空时整段校验被跳过；且 `parseCallback` 接受裸 code，服务端无法确认 code 与本次回调同源。
+- **修复**：
+  - 建任务/改链接**必须带 state**，否则 `400`；
+  - 回传**只接受整条回调链接**（含 `code=` 与 `state=`），裸 code 一律 `400`；
+  - 链接缺 state 的历史数据：回传直接 `409`，提示管理员更新链接；
+  - 事务内按**最新链接**的 state 再核一次。
+- 影响：B 侧必须从地址栏复制整条 URL（前端本来就引导这么做），`TOKEN#VERIFIER` 这类裸凭证不再可提交。
+
+### 3. 导出含凭据 + 审计写在输出之后
+
+- **问题**：导出直接吐明文 code/callback/邮箱/IP；`appendAudit` 在 `cw.Flush()` 之后，客户端可能已收完数据而审计失败/丢失。
+- **修复**：
+  - 默认**脱敏**：凭证 `前4……后2（长度）`、邮箱 `前2***@域名`、IP `a.b.x.x`；CSV 增列「导出模式」；
+  - 完整凭据需 `?secrets=1&confirm=EXPORT` 二次确认，界面按钮带 `confirm` 弹窗；
+  - **审计先写、再输出**，且区分 `mode=masked|full`。
+
+### 实测
+
+```
+/api/users 字段:      created,id,label,revoked,role,scope      ← 无 token
+/api/board members:   created,id,label,revoked                 ← 无 token/link
+缺 state 的链接    -> 400 授权链接缺少 state 参数…
+裸 code 回传       -> 400 请粘贴整条回调链接…不接受单独的授权码
+默认导出           -> 凭证 ***/……、邮箱 b1***@example.com、mode=masked
+secrets=1 无 confirm -> 400
+```
+
+### 新增测试（共 19 个）
+
+```
+PASS TestUserListNeverReturnsTokens            列表与看板都不含 token/link
+PASS TestLinkMustCarryState                    建/改链接缺 state 一律 400
+PASS TestReportRequiresFullCallbackURL         裸 code 400、缺 state 400、完整回调通过
+PASS TestExportIsMaskedByDefaultAndAuditedFirst 默认脱敏、完整导出需确认、审计区分模式
+```

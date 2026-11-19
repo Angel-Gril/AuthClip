@@ -272,22 +272,22 @@ function memberPanel() {
     }
   };
   const list = (state.board.members || []).map((m) => {
-    const shown = state.reveal.has(m.id);
-    const noLink = !m.link; // own 范围管理员拿不到接收人链接
+    // 长期链接不再随列表下发（防批量泄露）：要发就重新签发一条，只显示一次
     return el("div", { class: "member-row" },
       el("span", { class: "name", text: m.label }),
       m.revoked ? el("span", { class: "badge warn", text: "已吊销" }) : null,
-      noLink ? mono("（无权限查看链接）") : mono(shown ? m.link : maskLink(m.link)),
+      mono("链接不在列表中显示"),
       el("span", { class: "grow" }),
-      noLink ? null : el("button", {
-        type: "button", text: shown ? "隐藏" : "显示",
-        onclick: () => {
-          if (shown) state.reveal.delete(m.id); else state.reveal.add(m.id);
-          render();
+      el("button", {
+        type: "button", text: "重新生成链接", disabled: m.revoked,
+        onclick: async () => {
+          try {
+            const r = await api(`/api/users/${m.id}/rotate`, { method: "POST", body: {} });
+            await copy(r.link, "新链接已生成并复制（旧链接立即失效）");
+            await refresh();
+          } catch (e) { flash(e.message, "err"); }
         },
       }),
-      noLink ? null : el("button", { type: "button", text: "复制长期链接", onclick: () => copy(m.link, "长期链接已复制") }),
-      noLink ? null : el("a", { class: "btn", href: m.link, target: "_blank", rel: "noopener noreferrer", text: "打开" }),
     );
   });
 
@@ -555,9 +555,10 @@ function fact(label, value, wide = false) {
 }
 
 // 导出：token 走请求头，用 fetch 拿 blob 再触发下载（<a href> 带不了头）
-async function downloadExport(format) {
+async function downloadExport(format, secrets = false) {
   try {
-    const res = await fetch(`/api/export?format=${format}`, {
+    const qs = secrets ? `format=${format}&secrets=1&confirm=EXPORT` : `format=${format}`;
+    const res = await fetch(`/api/export?${qs}`, {
       headers: { "X-Token": state.token }, cache: "no-store",
     });
     if (!res.ok) {
@@ -573,7 +574,7 @@ async function downloadExport(format) {
     a.click();
     a.remove();
     setTimeout(() => URL.revokeObjectURL(a.href), 5000);
-    flash("已导出（含已归档任务）");
+      flash(secrets ? "已导出完整凭据（含已归档）——这份文件请勿外传" : "已导出（默认脱敏，含已归档任务）");
   } catch (e) {
     flash(e.message, "err");
   }
@@ -590,7 +591,14 @@ function adminView() {
     all ? el("div", { class: "row" },
       el("button", { type: "button", text: "导出 CSV", onclick: () => downloadExport("csv") }),
       el("button", { type: "button", text: "导出 JSON", onclick: () => downloadExport("json") }),
-      el("span", { class: "hint", text: "导出包含已归档任务，可用 Excel 直接打开。" }),
+      el("button", {
+        type: "button", class: "danger", text: "导出完整凭据",
+        onclick: () => {
+          if (!window.confirm("将导出明文凭证、邮箱与完整 IP，文件泄露等于凭证泄露。\n确认继续？")) return;
+          void downloadExport("csv", true);
+        },
+      }),
+      el("span", { class: "hint", text: "默认脱敏（凭证/邮箱/IP 打码）；完整导出会二次确认并留审计。" }),
     ) : null,
     feedbackLine(),
     newSlotForm(),
@@ -985,5 +993,6 @@ window.addEventListener("focus", () => {
 });
 
 void start();
+
 
 

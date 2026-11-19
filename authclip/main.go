@@ -55,7 +55,7 @@ const (
 	maxBody    = 128 << 10
 	maxLink    = 8192
 	sessionEC  = 20 * time.Second
-	appVersion = "v1.3.0" // v1.2: 账号/权限/审计｜v1.3: 归档历史 / 导出 / 留存期
+	appVersion = "v1.3.1" // v1.3: 归档历史/导出/留存期｜v1.3.1: 令牌不外泄 / state 强制 / 导出脱敏+先审计
 )
 
 // ---------------------------------------------------------------- 模型
@@ -850,14 +850,11 @@ func (a *app) board(w http.ResponseWriter, r *http.Request, u *User) {
 		if m.Role != "member" {
 			continue
 		}
-		row := map[string]any{"id": m.ID, "label": m.Label, "revoked": m.Revoked, "created": m.Created}
-		// 长期链接 = 该接收人的全部权限。own 范围的管理员只能看到标签，
-		// 拿到链接就等于能替对方提交回传，故不下发 token。
-		if all {
-			row["token"] = m.Token
-			row["link"] = a.linkFor(&m)
-		}
-		members = append(members, row)
+		// 长期链接不再随看板下发：需要时用 rotate 重新签发（一次性显示），
+		// 避免任何列表接口成为令牌批量出口。
+		members = append(members, map[string]any{
+			"id": m.ID, "label": m.Label, "revoked": m.Revoked, "created": m.Created,
+		})
 	}
 
 	slots := a.st.allSlots()
@@ -943,7 +940,15 @@ func (a *app) listUsers(w http.ResponseWriter, r *http.Request, u *User) {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "需要全量权限的管理员"})
 		return
 	}
-	writeJSON(w, http.StatusOK, a.st.users())
+	// 绝不回传 token：列表只给身份与状态，需要链接就 rotate 重新签发
+	out := make([]map[string]any, 0)
+	for _, x := range a.st.users() {
+		out = append(out, map[string]any{
+			"id": x.ID, "role": x.Role, "scope": x.scopeOf(), "label": x.Label,
+			"revoked": x.Revoked, "created": x.Created,
+		})
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (a *app) createUser(w http.ResponseWriter, r *http.Request, u *User) {
@@ -1105,31 +1110,76 @@ func (a *app) auditLog(w http.ResponseWriter, r *http.Request, u *User) {
 }
 
 // exportSlots：A 端批量导出（CSV / JSON），含已归档任务
+//
+// 默认脱敏：凭证/邮箱/IP 只给形状，不给原值。要完整凭据必须显式
+// ?secrets=1&confirm=EXPORT，且两种模式都会在写出前落审计。
 func (a *app) exportSlots(w http.ResponseWriter, r *http.Request, u *User) {
 	if !u.canSeeAll() {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "需要全量权限的管理员"})
 		return
 	}
+	full := r.URL.Query().Get("secrets") == "1"
+	if full && r.URL.Query().Get("confirm") != "EXPORT" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "导出完整凭据需要 ?secrets=1&confirm=EXPORT 二次确认",
+		})
+		return
+	}
+
 	label := map[string]string{}
 	for _, x := range a.st.users() {
 		label[x.ID] = x.Label
 	}
 	slots := a.st.exportSlots()
 	stamp := time.Now().Format("20060102-150405")
+	mode := "masked"
+	if full {
+		mode = "full"
+	}
+
+	// 审计先写，再吐数据：不允许出现「导出成功但没留痕」
+	a.st.appendAudit(&Audit{
+		Actor: u.ID, Label: u.Label, Action: "data.export",
+		Target: fmt.Sprintf("%d rows mode=%s", len(slots), mode),
+	})
+
+	pick := func(v string, mask func(string) string) string {
+		if full {
+			return v
+		}
+		return mask(v)
+	}
 
 	if r.URL.Query().Get("format") == "json" {
+		if !full {
+			red := make([]map[string]any, 0, len(slots))
+			for _, s := range slots {
+				red = append(red, map[string]any{
+					"id": s.ID, "label": s.Label, "member": label[s.Member], "owner": label[s.Owner],
+					"email": maskEmail(s.Email), "code": maskCode(s.Code),
+					"reg_region": s.RegRegion, "reg_ip": maskIP(s.RegIP),
+					"seen_ip": maskIP(s.SeenIP), "node_ip": maskIP(s.NodeIP),
+					"created": s.Created, "submitted": s.Submitted, "deleted": s.Deleted,
+					"redacted": true,
+				})
+			}
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="authclip-%s.json"`, stamp))
+			_ = json.NewEncoder(w).Encode(red)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="authclip-%s.json"`, stamp))
+		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="authclip-%s-full.json"`, stamp))
 		_ = json.NewEncoder(w).Encode(slots)
 		return
 	}
 
 	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
-	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="authclip-%s.csv"`, stamp))
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="authclip-%s-%s.csv"`, stamp, mode))
 	cw := csv.NewWriter(w)
 	_ = cw.Write([]string{
 		"id", "label", "状态", "接收人", "下发人", "邮箱", "凭证", "注册地区",
-		"注册IP", "观测IP", "节点IP", "创建时间", "回传时间", "已归档",
+		"注册IP", "观测IP", "节点IP", "创建时间", "回传时间", "已归档", "导出模式",
 	})
 	for _, s := range slots {
 		state := "待回传"
@@ -1140,14 +1190,56 @@ func (a *app) exportSlots(w http.ResponseWriter, r *http.Request, u *User) {
 			state = "已归档·" + state
 		}
 		_ = cw.Write([]string{
-			s.ID, s.Label, state, label[s.Member], label[s.Owner], s.Email, s.Code,
-			s.RegRegion, s.RegIP, s.SeenIP, s.NodeIP,
+			s.ID, s.Label, state, label[s.Member], label[s.Owner],
+			pick(s.Email, maskEmail), pick(s.Code, maskCode),
+			s.RegRegion, pick(s.RegIP, maskIP), pick(s.SeenIP, maskIP), pick(s.NodeIP, maskIP),
 			s.Created.Format("2006-01-02 15:04"), fmtTime(s.Submitted),
-			boolText(s.Deleted),
+			boolText(s.Deleted), mode,
 		})
 	}
 	cw.Flush()
-	a.st.appendAudit(&Audit{Actor: u.ID, Label: u.Label, Action: "data.export", Target: fmt.Sprintf("%d rows", len(slots))})
+}
+
+// 脱敏：保留可辨识的形状，去掉可用性
+func maskCode(s string) string {
+	if s == "" {
+		return ""
+	}
+	runes := []rune(s)
+	if len(runes) <= 6 {
+		return "***"
+	}
+	return string(runes[:4]) + "……" + string(runes[len(runes)-2:]) + fmt.Sprintf("（%d 字符）", len(runes))
+}
+
+func maskEmail(s string) string {
+	if s == "" {
+		return ""
+	}
+	at := strings.LastIndex(s, "@")
+	if at <= 0 {
+		return "***"
+	}
+	local, domain := s[:at], s[at:]
+	head := local
+	if len([]rune(head)) > 2 {
+		head = string([]rune(head)[:2])
+	}
+	return head + "***" + domain
+}
+
+func maskIP(s string) string {
+	if s == "" {
+		return ""
+	}
+	if ip, err := netip.ParseAddr(s); err == nil {
+		if ip.Is4() {
+			b := ip.As4()
+			return fmt.Sprintf("%d.%d.x.x", b[0], b[1])
+		}
+		return "IPv6"
+	}
+	return "***"
 }
 
 func fmtTime(t time.Time) string {
@@ -1187,6 +1279,13 @@ func (a *app) createSlot(w http.ResponseWriter, r *http.Request, u *User) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "授权链接格式不正确"})
 		return
 	}
+	// 没有 state 就无法把回传绑定到这一次授权，直接拒收
+	if linkStateOf(link) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "授权链接缺少 state 参数，无法校验回调归属，请使用带 state 的授权链接",
+		})
+		return
+	}
 	label := strings.TrimSpace(body.Label)
 	if len(label) > 60 {
 		label = label[:60]
@@ -1223,6 +1322,12 @@ func (a *app) patchSlot(w http.ResponseWriter, r *http.Request, u *User) {
 		v := strings.TrimSpace(*body.Link)
 		if v == "" || len(v) > maxLink || !plausibleURL(v) {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "授权链接格式不正确"})
+			return
+		}
+		if linkStateOf(v) == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error": "授权链接缺少 state 参数，无法校验回调归属",
+			})
 			return
 		}
 	}
@@ -1399,19 +1504,26 @@ func (a *app) report(w http.ResponseWriter, r *http.Request, u *User) {
 	code := strings.TrimSpace(body.Code)
 	stateParam := ""
 
-	// 允许把整条回调链接塞进 code 框或 callback 框，服务端兜底解析
-	for _, raw := range []string{callback, code} {
-		if c, st, ok := parseCallback(raw); ok {
-			if code == "" {
-				code = c
-			}
-			if stateParam == "" {
-				stateParam = st
-			}
-			if callback == "" && strings.Contains(raw, "?") {
-				callback = raw
-			}
-		}
+	// 只接受「整条回调链接」：code 与 state 必须来自同一次回调。
+	// 允许把它塞进 code 框（前端有用户会粘错位置），但仍要求是带 ?code=&state= 的 URL。
+	if callback == "" {
+		callback = code
+		code = ""
+	}
+	if !strings.Contains(callback, "code=") {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "请粘贴整条回调链接（形如 http://localhost:54545/callback?code=…&state=…），不接受单独的授权码",
+		})
+		return
+	}
+	if c, st, ok := parseCallback(callback); ok {
+		code, stateParam = c, st
+	}
+	if stateParam == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "回调链接里没有 state，无法确认它属于本次授权",
+		})
+		return
 	}
 
 	regIP := strings.TrimSpace(body.RegIP)
@@ -1452,20 +1564,19 @@ func (a *app) report(w http.ResponseWriter, r *http.Request, u *User) {
 	}
 
 	// 服务端核对 OAuth 归属：回调里的 state 必须与当前授权链接里的 state 一致。
-	// 否则任何人都能把别处的 code 塞进这条任务（或任务被改派后继续用旧链接的回传）。
-	if want := linkStateOf(sl.Link); want != "" {
-		switch {
-		case stateParam == "":
-			writeJSON(w, http.StatusBadRequest, map[string]string{
-				"error": "需要整条回调链接：其中必须带 state（服务端要核对归属）",
-			})
-			return
-		case stateParam != want:
-			writeJSON(w, http.StatusConflict, map[string]string{
-				"error": "回调的 state 与当前授权链接不一致，可能拿错了链接（或该任务已改派/换过链接）",
-			})
-			return
-		}
+	// 链接本身没有 state 时不再「跳过校验」，而是直接拒绝（无 state 即无法绑定）。
+	want := linkStateOf(sl.Link)
+	if want == "" {
+		writeJSON(w, http.StatusConflict, map[string]string{
+			"error": "该任务的授权链接缺少 state，无法校验回调归属，请管理员更新链接",
+		})
+		return
+	}
+	if stateParam != want {
+		writeJSON(w, http.StatusConflict, map[string]string{
+			"error": "回调的 state 与当前授权链接不一致，可能拿错了链接（或该任务已改派/换过链接）",
+		})
+		return
 	}
 
 	observed := a.observed(r)
@@ -1478,8 +1589,8 @@ func (a *app) report(w http.ResponseWriter, r *http.Request, u *User) {
 			denied = true
 			return errors.New("reassigned or archived")
 		}
-		// 链接在提交期间被换掉，也要按新链接的 state 再核一次
-		if want := linkStateOf(s.Link); want != "" && stateParam != want {
+		// 链接在提交期间被换掉：按新链接重新比一次
+		if cur := linkStateOf(s.Link); cur == "" || cur != stateParam {
 			denied = true
 			return errors.New("link changed")
 		}
@@ -1697,5 +1808,6 @@ func plausibleURL(s string) bool {
 	}
 	return host != "" && !strings.ContainsAny(host, " \t\r\n")
 }
+
 
 

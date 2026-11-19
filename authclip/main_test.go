@@ -435,7 +435,7 @@ func TestExportCSV(t *testing.T) {
 	})
 	e.call(t, "DELETE", "/api/slots/"+id, e.admin.Token, nil) // 归档的也要出现在导出里
 
-	req, _ := http.NewRequest("GET", e.srv.URL+"/api/export?format=csv", nil)
+	req, _ := http.NewRequest("GET", e.srv.URL+"/api/export?format=csv&secrets=1&confirm=EXPORT", nil)
 	req.Header.Set("X-Token", e.admin.Token)
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -470,3 +470,143 @@ func asSlice(v any) []any {
 	}
 	return nil
 }
+
+// ---------------------------------------------------------------- v1.3.1 安全项
+
+func TestUserListNeverReturnsTokens(t *testing.T) {
+	e := newEnv(t, "")
+	req, _ := http.NewRequest("GET", e.srv.URL+"/api/users", nil)
+	req.Header.Set("X-Token", e.admin.Token)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	var rows []map[string]any
+	if err := json.NewDecoder(res.Body).Decode(&rows); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(rows) == 0 {
+		t.Fatal("账号列表为空")
+	}
+	for _, r := range rows {
+		if _, has := r["token"]; has {
+			t.Fatalf("账号列表泄露 token：%v", r)
+		}
+	}
+	// 看板的接收人列表同样不能带链接/token
+	_, board := e.call(t, "GET", "/api/board", e.admin.Token, nil)
+	for _, m := range board["members"].([]any) {
+		row := m.(map[string]any)
+		if _, has := row["token"]; has {
+			t.Fatal("看板泄露接收人 token")
+		}
+		if _, has := row["link"]; has {
+			t.Fatal("看板泄露接收人长期链接")
+		}
+	}
+}
+
+func TestLinkMustCarryState(t *testing.T) {
+	e := newEnv(t, "")
+	noState := "https://claude.ai/oauth/authorize?client_id=PLACEHOLDER&code=true&response_type=code"
+	code, _ := e.call(t, "POST", "/api/slots", e.admin.Token, map[string]any{
+		"member": e.b1.ID, "link": noState, "label": "nostate",
+	})
+	if code != http.StatusBadRequest {
+		t.Fatalf("缺 state 的链接应被拒，实际 %d", code)
+	}
+	// 改链接也不能改成无 state 的
+	id := e.newSlot(t, e.b1)
+	if code, _ := e.call(t, "PATCH", "/api/slots/"+id, e.admin.Token, map[string]any{"link": noState}); code != http.StatusBadRequest {
+		t.Fatalf("PATCH 缺 state 应被拒，实际 %d", code)
+	}
+}
+
+func TestReportRequiresFullCallbackURL(t *testing.T) {
+	e := newEnv(t, "")
+	id := e.newSlot(t, e.b1)
+	base := map[string]any{"email": "b@example.com"}
+
+	// 裸授权码：拒
+	body := map[string]any{"email": "b@example.com", "code": "BARE-CODE-ONLY"}
+	if code, _ := e.call(t, "POST", "/api/slots/"+id+"/report", e.b1.Token, body); code != http.StatusBadRequest {
+		t.Fatalf("裸 code 应被拒，实际 %d", code)
+	}
+	// 有 URL 但没 state：拒
+	_ = base
+	body = map[string]any{"email": "b@example.com", "callback": "http://localhost:54545/callback?code=X"}
+	if code, _ := e.call(t, "POST", "/api/slots/"+id+"/report", e.b1.Token, body); code != http.StatusBadRequest {
+		t.Fatalf("缺 state 的回调应被拒，实际 %d", code)
+	}
+	// 完整且 state 匹配：通过
+	body = map[string]any{"email": "b@example.com", "callback": "http://localhost:54545/callback?code=OK&state=STATE-ONE"}
+	if code, out := e.call(t, "POST", "/api/slots/"+id+"/report", e.b1.Token, body); code != http.StatusOK {
+		t.Fatalf("完整回调应通过，实际 %d %v", code, out)
+	}
+}
+
+func TestExportIsMaskedByDefaultAndAuditedFirst(t *testing.T) {
+	e := newEnv(t, "")
+	id := e.newSlot(t, e.b1)
+	e.call(t, "POST", "/api/slots/"+id+"/report", e.b1.Token, map[string]any{
+		"email": "b1@example.com", "callback": "http://localhost:54545/callback?code=SUPERSECRETCODE&state=STATE-ONE",
+	})
+
+	get := func(qs string) (int, string) {
+		req, _ := http.NewRequest("GET", e.srv.URL+"/api/export"+qs, nil)
+		req.Header.Set("X-Token", e.admin.Token)
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer res.Body.Close()
+		raw, _ := io.ReadAll(res.Body)
+		return res.StatusCode, string(raw)
+	}
+
+	code, body := get("?format=csv")
+	if code != http.StatusOK {
+		t.Fatalf("export: %d", code)
+	}
+	if strings.Contains(body, "SUPERSECRETCODE") || strings.Contains(body, "b1@example.com") {
+		t.Fatalf("默认导出泄露明文：\n%s", body)
+	}
+	if !strings.Contains(body, "……") && !strings.Contains(body, "***") {
+		t.Fatalf("默认导出应打码：\n%s", body)
+	}
+
+	// 完整导出必须二次确认
+	if code, _ := get("?format=csv&secrets=1"); code != http.StatusBadRequest {
+		t.Fatalf("未带 confirm 应 400，实际 %d", code)
+	}
+	if code, body := get("?format=csv&secrets=1&confirm=EXPORT"); code != http.StatusOK || !strings.Contains(body, "SUPERSECRETCODE") {
+		t.Fatalf("确认后应导出明文：%d", code)
+	}
+
+	// 审计：每次导出都留痕，且含模式
+	req, _ := http.NewRequest("GET", e.srv.URL+"/api/audit", nil)
+	req.Header.Set("X-Token", e.admin.Token)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	var rows []map[string]any
+	_ = json.NewDecoder(res.Body).Decode(&rows)
+	var modes []string
+	for _, r := range rows {
+		if r["action"] == "data.export" {
+			modes = append(modes, r["target"].(string))
+		}
+	}
+	if len(modes) < 2 {
+		t.Fatalf("导出审计条数不足：%v", modes)
+	}
+	joined := strings.Join(modes, "|")
+	if !strings.Contains(joined, "mode=masked") || !strings.Contains(joined, "mode=full") {
+		t.Fatalf("审计未区分模式：%s", joined)
+	}
+}
+
+
