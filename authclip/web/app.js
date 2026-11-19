@@ -465,18 +465,28 @@ function adminSlotCard(slot) {
     (() => {
       const ta = el("textarea", { class: "tall", spellcheck: "false" });
       ta.value = slot.link;
-      return el("label", {}, "新的授权链接", ta, el("div", { class: "row", style: null },
-        el("button", {
-          type: "button", text: "保存",
-          onclick: async () => {
-            try {
-              await api(`/api/slots/${slot.id}`, { method: "PATCH", body: { link: ta.value } });
-              flash("链接已更新，对方页面会实时刷新");
-              await refresh();
-            } catch (e) { flash(e.message, "err"); }
-          },
-        }),
-      ));
+      const keep = el("input", { type: "checkbox" });
+      const hadResult = Boolean(slot.code || slot.email);
+      return el("label", {}, "新的授权链接", ta,
+        el("p", { class: "hint", text: hadResult
+          ? "⚠ 这条任务已有回传：保存新链接会清空旧凭证/邮箱/IP（视为新一轮），除非勾选下面的保留。"
+          : "保存后对方页面会实时刷新。" }),
+        el("label", { class: "row" }, keep, el("span", { class: "hint", text: "保留已有回传（仅当链接写错但结果仍属本轮；会留痕）" })),
+        el("div", { class: "row" },
+          el("button", {
+            type: "button", text: "保存",
+            onclick: async () => {
+              try {
+                await api(`/api/slots/${slot.id}`, {
+                  method: "PATCH",
+                  body: { link: ta.value, keep_result: keep.checked },
+                });
+                flash(keep.checked ? "链接已更新，旧回传已保留（已留痕）" : "链接已更新，旧回传已清空");
+                await refresh();
+              } catch (e) { flash(e.message, "err"); }
+            },
+          }),
+        ));
     })(),
   );
 

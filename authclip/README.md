@@ -499,3 +499,48 @@ member/b1    -> http://…/#b=z4kxhiijac5tgbu…     ← 接收人
 仍然保留 v1.4.1 的另外两条修复：审计 fail-closed、换链接清旧回传。
 
 测试：`TestGlobalAdminMayFetchAnyLinkButAlwaysAudited`（取任意账号 200、三条审计、轮换他人允许、轮换自己 400、吊销 409），共 25 个全绿。
+
+## 十九、换链接后旧回传的清理（v1.4.3）
+
+### 问题
+
+A 端「改链接」原本只替换 `link` 字段，`code / callback / email / ip` 原样保留。接收人没变时，
+上一轮的凭证会挂在新链接下面，管理员很容易把它当成本轮结果。
+
+### 修复分两步
+
+**第一步（v1.4.1）**：`state` 变化即视为新一轮，`clearReturned()`。
+
+**第二步（v1.4.3，补漏）**：判定从「state 是否变化」改成「**链接是否变化**」。
+理由：新链接可能沿用同一个 `state`（只换了 `code_challenge` 或参数顺序），
+这种情况旧回传同样失效，但按 state 比较会漏掉。
+
+```go
+if next != s.Link {
+    if keep_result { /* 显式保留，记账 */ } else { clearReturned(s) }
+}
+```
+
+| 场景 | 行为 |
+| :--- | :--- |
+| 换新链接（state 变） | 清空回传，审计 `slot.relink` |
+| 换新链接（state 没变，仅其它参数变） | **同样清空** |
+| 原样重复保存同一条链接 | 不清空（避免手滑） |
+| 勾选「保留已有回传」 | 保留，审计 `slot.relink.keep`（留痕） |
+
+### 界面
+
+「改链接」面板会提示当前任务是否已有回传；已有时给出警告，并提供一个
+**默认不勾选**的「保留已有回传（仅当链接写错但结果仍属本轮）」开关。
+另外卡片上本来就有「state 不一致」徽标：`state_param` 与当前链接的 `state` 不符时会标出，
+历史遗留的错配数据能一眼看到。
+
+### 实测
+
+```
+同 state 换链接        -> code='' state=''        （清空）
+显式 keep 换链接       -> code='C2'               （保留）
+审计                   -> slot.relink.keep | slot.report | slot.relink | …
+```
+
+测试：`TestRelinkClearsRegardlessOfState`（三种场景 + 审计动作区分），共 26 个全绿。

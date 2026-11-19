@@ -55,7 +55,7 @@ const (
 	maxBody    = 128 << 10
 	maxLink    = 8192
 	sessionEC  = 20 * time.Second
-	appVersion = "v1.4.2" // v1.4.1: 审计 fail-closed / 换链清旧回传｜v1.4.2: 全局管理员可取任意链接（留审计）
+	appVersion = "v1.4.3" // v1.4.2: 全局管理员可取链接｜v1.4.3: 换链一律清回传（可显式保留+留痕）
 )
 
 // ---------------------------------------------------------------- 模型
@@ -1507,12 +1507,13 @@ func (a *app) patchSlot(w http.ResponseWriter, r *http.Request, u *User) {
 		return
 	}
 	var body struct {
-		Link   *string `json:"link"`
-		Label  *string `json:"label"`
-		Member *string `json:"member"`
-		NodeIP *string `json:"node_ip"`
-		Region *string `json:"region"`
-		Email  *string `json:"email"`
+		Link       *string `json:"link"`
+		Label      *string `json:"label"`
+		Member     *string `json:"member"`
+		NodeIP     *string `json:"node_ip"`
+		Region     *string `json:"region"`
+		Email      *string `json:"email"`
+		KeepResult *bool   `json:"keep_result"` // 仅当链接写错但结果仍有效时显式保留
 	}
 	if err := decode(w, r, &body); err != nil {
 		return
@@ -1560,13 +1561,19 @@ func (a *app) patchSlot(w http.ResponseWriter, r *http.Request, u *User) {
 			return
 		}
 	}
+	relinkKept := false
 	sl, err := a.st.updateSlot(r.PathValue("id"), func(s *Slot) error {
 		if body.Link != nil {
 			next := strings.TrimSpace(*body.Link)
-			// 换链接 = 新一轮授权：旧回传必须清掉，否则管理员会把
-			// 上一轮的 code 当成本轮结果（state 不同即视为新一轮）。
-			if next != s.Link && linkStateOf(next) != linkStateOf(s.Link) {
-				clearReturned(s)
+			// 换链接 = 新一轮授权。判定用「链接是否变化」而不是「state 是否变化」：
+			// 新链接沿用同一个 state 时，旧回传同样失效，必须清掉。
+			if next != s.Link {
+				if body.KeepResult != nil && *body.KeepResult {
+					// 显式保留（管理员认旧结果仍属于本轮），会单独留痕
+					relinkKept = true
+				} else {
+					clearReturned(s)
+				}
 			}
 			s.Link = next
 		}
@@ -1605,6 +1612,8 @@ func (a *app) patchSlot(w http.ResponseWriter, r *http.Request, u *User) {
 	switch {
 	case body.Member != nil:
 		action = "slot.reassign"
+	case body.Link != nil && relinkKept:
+		action = "slot.relink.keep" // 换了链接但显式保留了旧回传
 	case body.Link != nil:
 		action = "slot.relink"
 	}
@@ -2016,6 +2025,9 @@ func plausibleURL(s string) bool {
 	}
 	return host != "" && !strings.ContainsAny(host, " \t\r\n")
 }
+
+
+
 
 
 

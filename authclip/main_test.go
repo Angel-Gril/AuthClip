@@ -888,3 +888,58 @@ func TestRelinkClearsPreviousResult(t *testing.T) {
 	}
 }
 
+
+// ---------------------------------------------------------------- v1.4.3
+
+// 换链接的三种情况：改 state、只改 challenge（state 不变）、原样重复写
+func TestRelinkClearsRegardlessOfState(t *testing.T) {
+	e := newEnv(t, "")
+	id := e.newSlot(t, e.b1)
+
+	fill := func(code, state string) {
+		t.Helper()
+		if c, out := e.call(t, "POST", "/api/slots/"+id+"/report", e.b1.Token, map[string]any{
+			"email": "x@example.com", "callback": "http://localhost:54545/callback?code=" + code + "&state=" + state,
+		}); c != http.StatusOK {
+			t.Fatalf("report: %d %v", c, out)
+		}
+	}
+	current := func() *Slot { return e.app.st.slotByID(id) }
+
+	// 1) state 变化 -> 清
+	fill("CODE-A", "STATE-ONE")
+	sameStateLink := strings.Replace(testLink, "CHAL", "CHAL2", 1) // 只改 challenge，state 仍是 STATE-ONE
+	if c, out := e.call(t, "PATCH", "/api/slots/"+id, e.admin.Token, map[string]any{"link": sameStateLink}); c != http.StatusOK {
+		t.Fatalf("relink: %d %v", c, out)
+	}
+	if sl := current(); sl.Code != "" || sl.Email != "" || sl.StateParam != "" {
+		t.Fatalf("同 state 换链接也必须清空，实际 %+v", sl)
+	}
+
+	// 2) 原样重复写同一条链接 -> 不清
+	fill("CODE-B", "STATE-ONE")
+	if c, _ := e.call(t, "PATCH", "/api/slots/"+id, e.admin.Token, map[string]any{"link": sameStateLink}); c != http.StatusOK {
+		t.Fatal("重复写同一链接失败")
+	}
+	if sl := current(); sl.Code != "CODE-B" {
+		t.Fatalf("同一链接重复写不应清空，实际 %q", sl.Code)
+	}
+
+	// 3) 显式 keep_result=true -> 保留，且审计动作可区分
+	other := strings.Replace(testLink, "STATE-ONE", "STATE-TWO", 1)
+	if c, out := e.call(t, "PATCH", "/api/slots/"+id, e.admin.Token, map[string]any{"link": other, "keep_result": true}); c != http.StatusOK {
+		t.Fatalf("keep relink: %d %v", c, out)
+	}
+	if sl := current(); sl.Code != "CODE-B" {
+		t.Fatalf("keep_result=true 应保留回传，实际 %q", sl.Code)
+	}
+	found := false
+	for _, r := range e.app.st.audit(50) {
+		if r.Action == "slot.relink.keep" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("显式保留未留痕（slot.relink.keep）")
+	}
+}
