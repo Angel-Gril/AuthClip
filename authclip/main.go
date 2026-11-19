@@ -54,18 +54,33 @@ const (
 	maxBody    = 128 << 10
 	maxLink    = 8192
 	sessionEC  = 20 * time.Second
-	appVersion = "v1.1.0" // v1.1.0: 修改派泄露 / state 归属校验 / 查询参数令牌 / 静态加密
+	appVersion = "v1.2.0" // v1.1.0: 三条阻断项修复｜v1.2.0: 账号管理 / 权限范围 / 吊销轮换 / 审计
 )
 
 // ---------------------------------------------------------------- 模型
 
 type User struct {
 	ID      string    `json:"id"`
-	Role    string    `json:"role"` // admin | member
+	Role    string    `json:"role"`  // admin | member
+	Scope   string    `json:"scope"` // admin: all | own；member 忽略
 	Label   string    `json:"label"`
 	Token   string    `json:"token"`
+	Revoked bool      `json:"revoked"`
 	Created time.Time `json:"created"`
 }
+
+// scopeOf：空值按 all 处理（兼容 v1.1 之前建的管理员）
+func (u *User) scopeOf() string {
+	if u.Role != "admin" {
+		return "member"
+	}
+	if u.Scope == "own" {
+		return "own"
+	}
+	return "all"
+}
+
+func (u *User) canSeeAll() bool { return u.scopeOf() == "all" }
 
 type Slot struct {
 	ID      string    `json:"id"`
@@ -95,8 +110,19 @@ type Slot struct {
 func (s *Slot) filled() bool { return s.Code != "" || s.Email != "" }
 
 type data struct {
-	Users []*User `json:"users"`
-	Slots []*Slot `json:"slots"`
+	Users []*User  `json:"users"`
+	Slots []*Slot  `json:"slots"`
+	Audit []*Audit `json:"audit"`
+}
+
+// Audit 只记录「谁对哪条做了什么」，不含凭证明文，便于追责又不扩大泄露面
+type Audit struct {
+	At     time.Time `json:"at"`
+	Actor  string    `json:"actor"`
+	Label  string    `json:"label"`
+	Action string    `json:"action"`
+	Slot   string    `json:"slot"`
+	Target string    `json:"target"`
 }
 
 // ---------------------------------------------------------------- 存储
@@ -249,10 +275,13 @@ func newToken() string {
 	return strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(b))
 }
 
-func (s *store) addUser(role, label string) (*User, error) {
+func (s *store) addUser(role, scope, label string) (*User, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	u := &User{ID: newToken()[:10], Role: role, Label: label, Token: newToken(), Created: time.Now().UTC()}
+	u := &User{ID: newToken()[:10], Role: role, Scope: scope, Label: label, Token: newToken(), Created: time.Now().UTC()}
+	if role != "admin" {
+		u.Scope = ""
+	}
 	s.d.Users = append(s.d.Users, u)
 	if err := s.saveLocked(); err != nil {
 		s.d.Users = s.d.Users[:len(s.d.Users)-1]
@@ -263,6 +292,73 @@ func (s *store) addUser(role, label string) (*User, error) {
 	return &cp, nil
 }
 
+func (s *store) updateUser(id string, fn func(*User) error) (*User, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, u := range s.d.Users {
+		if u.ID != id {
+			continue
+		}
+		prev := *u
+		if err := fn(u); err != nil {
+			*u = prev
+			return nil, err
+		}
+		if err := s.saveLocked(); err != nil {
+			*u = prev
+			return nil, err
+		}
+		cp := *u
+		s.notifyLocked("admin")
+		s.notifyLocked("u:" + u.ID)
+		return &cp, nil
+	}
+	return nil, os.ErrNotExist
+}
+
+func (s *store) removeUser(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i, u := range s.d.Users {
+		if u.ID != id {
+			continue
+		}
+		for _, sl := range s.d.Slots {
+			if sl.Member == id || sl.Owner == id {
+				return errors.New("该账号名下还有任务")
+			}
+		}
+		s.d.Users = append(s.d.Users[:i], s.d.Users[i+1:]...)
+		if err := s.saveLocked(); err != nil {
+			return err
+		}
+		s.notifyLocked("admin")
+		return nil
+	}
+	return os.ErrNotExist
+}
+
+func (s *store) appendAudit(a *Audit) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	a.At = time.Now().UTC()
+	s.d.Audit = append(s.d.Audit, a)
+	if len(s.d.Audit) > 500 { // 只留最近 500 条
+		s.d.Audit = s.d.Audit[len(s.d.Audit)-500:]
+	}
+	_ = s.saveLocked()
+}
+
+func (s *store) audit(limit int) []Audit {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]Audit, 0, limit)
+	for i := len(s.d.Audit) - 1; i >= 0 && len(out) < limit; i-- {
+		out = append(out, *s.d.Audit[i])
+	}
+	return out
+}
+
 func (s *store) userByToken(tok string) *User {
 	if tok == "" {
 		return nil
@@ -271,6 +367,9 @@ func (s *store) userByToken(tok string) *User {
 	defer s.mu.Unlock()
 	for _, u := range s.d.Users {
 		if u.Token == tok {
+			if u.Revoked { // 已吊销：一律拒绝，等同无效链接
+				return nil
+			}
 			cp := *u
 			return &cp
 		}
@@ -484,6 +583,13 @@ func (a *app) routes() (http.Handler, error) {
 	mux.HandleFunc("GET /api/mine", a.wrap(a.mine))
 	mux.HandleFunc("POST /api/slots/{id}/report", a.wrap(a.report))
 	mux.HandleFunc("GET /api/stream", a.wrap(a.stream))
+	// 账号与权限（需要 all 范围）
+	mux.HandleFunc("GET /api/users", a.wrap(a.listUsers))
+	mux.HandleFunc("POST /api/users", a.wrap(a.createUser))
+	mux.HandleFunc("PATCH /api/users/{id}", a.wrap(a.patchUser))
+	mux.HandleFunc("POST /api/users/{id}/rotate", a.wrap(a.rotateUser))
+	mux.HandleFunc("DELETE /api/users/{id}", a.wrap(a.deleteUser))
+	mux.HandleFunc("GET /api/audit", a.wrap(a.auditLog))
 
 	static, err := fs.Sub(webFS, "web")
 	if err != nil {
@@ -500,18 +606,34 @@ func (a *app) cli(args []string) {
 	switch args[0] {
 	case "users":
 		for _, u := range a.st.users() {
-			fmt.Printf("%-6s %-10s %s\n", u.Role, u.ID, u.Label)
+			state := ""
+			if u.Revoked {
+				state = "  [已吊销]"
+			}
+			fmt.Printf("%-6s %-4s %-10s %s%s\n", u.Role, u.scopeOf(), u.ID, u.Label, state)
 		}
 	case "add":
 		if len(args) < 3 || (args[1] != "admin" && args[1] != "member") {
-			fmt.Println("用法: authclip add admin|member 标签")
+			fmt.Println("用法: authclip add admin|member 标签 [all|own]")
 			os.Exit(2)
 		}
-		u, err := a.st.addUser(args[1], strings.Join(args[2:], " "))
+		scope := ""
+		labelParts := args[2:]
+		if args[1] == "admin" && len(labelParts) > 1 {
+			last := labelParts[len(labelParts)-1]
+			if last == "all" || last == "own" {
+				scope = last
+				labelParts = labelParts[:len(labelParts)-1]
+			}
+		}
+		if args[1] == "admin" && scope == "" {
+			scope = "all"
+		}
+		u, err := a.st.addUser(args[1], scope, strings.Join(labelParts, " "))
 		if err != nil {
 			log.Fatal(err)
 		}
-		fmt.Printf("已创建 %s「%s」\n长期链接: %s\n", u.Role, u.Label, a.linkFor(u))
+		fmt.Printf("已创建 %s「%s」范围=%s\n长期链接: %s\n", u.Role, u.Label, u.scopeOf(), a.linkFor(u))
 	case "link":
 		if len(args) < 3 {
 			fmt.Println("用法: authclip link admin|member 标签")
@@ -604,7 +726,9 @@ func (a *app) config(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *app) me(w http.ResponseWriter, r *http.Request, u *User) {
-	writeJSON(w, http.StatusOK, map[string]string{"id": u.ID, "role": u.Role, "label": u.Label})
+	writeJSON(w, http.StatusOK, map[string]string{
+		"id": u.ID, "role": u.Role, "label": u.Label, "scope": u.scopeOf(),
+	})
 }
 
 func (a *app) board(w http.ResponseWriter, r *http.Request, u *User) {
@@ -612,17 +736,60 @@ func (a *app) board(w http.ResponseWriter, r *http.Request, u *User) {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "仅管理员"})
 		return
 	}
+	all := u.canSeeAll()
 	members := []map[string]any{}
 	for _, m := range a.st.users() {
 		if m.Role != "member" {
 			continue
 		}
-		members = append(members, map[string]any{
-			"id": m.ID, "label": m.Label, "token": m.Token,
-			"link": a.linkFor(&m), "created": m.Created,
-		})
+		row := map[string]any{"id": m.ID, "label": m.Label, "revoked": m.Revoked, "created": m.Created}
+		// 长期链接 = 该接收人的全部权限。own 范围的管理员只能看到标签，
+		// 拿到链接就等于能替对方提交回传，故不下发 token。
+		if all {
+			row["token"] = m.Token
+			row["link"] = a.linkFor(&m)
+		}
+		members = append(members, row)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"members": members, "slots": a.st.allSlots()})
+
+	slots := a.st.allSlots()
+	if !all {
+		own := make([]Slot, 0, len(slots))
+		for _, s := range slots {
+			if s.Owner == u.ID {
+				own = append(own, s)
+			}
+		}
+		slots = own
+	}
+
+	resp := map[string]any{"members": members, "slots": slots, "scope": u.scopeOf()}
+	if all {
+		users := []map[string]any{}
+		for _, x := range a.st.users() {
+			users = append(users, map[string]any{
+				"id": x.ID, "role": x.Role, "scope": x.scopeOf(), "label": x.Label,
+				"revoked": x.Revoked, "created": x.Created, "self": x.ID == u.ID,
+			})
+		}
+		resp["users"] = users
+		resp["audit"] = a.st.audit(50)
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// guardSlot：own 范围的管理员只能动自己创建的任务
+func (a *app) guardSlot(w http.ResponseWriter, u *User, slotID string) *Slot {
+	sl := a.st.slotByID(slotID)
+	if sl == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "任务不存在"})
+		return nil
+	}
+	if !u.canSeeAll() && sl.Owner != u.ID {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "任务不存在"})
+		return nil
+	}
+	return sl
 }
 
 func (a *app) addMember(w http.ResponseWriter, r *http.Request, u *User) {
@@ -643,14 +810,184 @@ func (a *app) addMember(w http.ResponseWriter, r *http.Request, u *User) {
 	if len(label) > 40 {
 		label = label[:40]
 	}
-	m, err := a.st.addUser("member", label)
+	m, err := a.st.addUser("member", "", label)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "写入失败"})
 		return
 	}
+	a.st.appendAudit(&Audit{Actor: u.ID, Label: u.Label, Action: "user.create", Target: m.ID + ":" + m.Label})
+	// 链接只在创建这一次完整返回；own 范围管理员后续无法再取到
 	writeJSON(w, http.StatusOK, map[string]any{
 		"id": m.ID, "label": m.Label, "token": m.Token, "link": a.linkFor(m),
 	})
+}
+
+// ---------------------------------------------------------------- 账号与权限
+
+func (a *app) listUsers(w http.ResponseWriter, r *http.Request, u *User) {
+	if !u.canSeeAll() {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "需要全量权限的管理员"})
+		return
+	}
+	writeJSON(w, http.StatusOK, a.st.users())
+}
+
+func (a *app) createUser(w http.ResponseWriter, r *http.Request, u *User) {
+	if !u.canSeeAll() {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "需要全量权限的管理员"})
+		return
+	}
+	var body struct {
+		Role  string `json:"role"`
+		Scope string `json:"scope"`
+		Label string `json:"label"`
+	}
+	if err := decode(w, r, &body); err != nil {
+		return
+	}
+	role := strings.TrimSpace(body.Role)
+	if role != "admin" && role != "member" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "role 只能是 admin 或 member"})
+		return
+	}
+	scope := strings.TrimSpace(body.Scope)
+	if role == "admin" && scope != "own" {
+		scope = "all" // 默认给全量；要收敛必须显式传 own
+	}
+	label := strings.TrimSpace(body.Label)
+	if label == "" {
+		label = "未命名"
+	}
+	if len(label) > 40 {
+		label = label[:40]
+	}
+	nu, err := a.st.addUser(role, scope, label)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "写入失败"})
+		return
+	}
+	a.st.appendAudit(&Audit{Actor: u.ID, Label: u.Label, Action: "user.create", Target: nu.ID + ":" + nu.Label})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id": nu.ID, "role": nu.Role, "scope": nu.scopeOf(), "label": nu.Label,
+		"link": a.linkFor(nu), "token": nu.Token,
+	})
+}
+
+func (a *app) patchUser(w http.ResponseWriter, r *http.Request, u *User) {
+	if !u.canSeeAll() {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "需要全量权限的管理员"})
+		return
+	}
+	var body struct {
+		Label  *string `json:"label"`
+		Scope  *string `json:"scope"`
+		Revoke *bool   `json:"revoke"`
+	}
+	if err := decode(w, r, &body); err != nil {
+		return
+	}
+	id := r.PathValue("id")
+	target := a.st.userByID(id)
+	if target == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "账号不存在"})
+		return
+	}
+	if body.Scope != nil && target.Role != "admin" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "接收人没有 scope"})
+		return
+	}
+	if body.Revoke != nil && *body.Revoke && target.ID == u.ID {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "不能吊销自己"})
+		return
+	}
+	upd, err := a.st.updateUser(id, func(x *User) error {
+		if body.Label != nil {
+			v := strings.TrimSpace(*body.Label)
+			if len(v) > 40 {
+				v = v[:40]
+			}
+			x.Label = v
+		}
+		if body.Scope != nil {
+			if strings.TrimSpace(*body.Scope) == "own" {
+				x.Scope = "own"
+			} else {
+				x.Scope = "all"
+			}
+		}
+		if body.Revoke != nil {
+			x.Revoked = *body.Revoke
+		}
+		return nil
+	})
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "账号不存在"})
+		return
+	}
+	action := "user.update"
+	if body.Revoke != nil {
+		action = "user.revoke"
+		if !*body.Revoke {
+			action = "user.restore"
+		}
+	}
+	a.st.appendAudit(&Audit{Actor: u.ID, Label: u.Label, Action: action, Target: id + ":" + upd.Label})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id": upd.ID, "role": upd.Role, "scope": upd.scopeOf(), "label": upd.Label, "revoked": upd.Revoked,
+	})
+}
+
+// rotateUser：换一条长期链接，旧链接立即失效
+func (a *app) rotateUser(w http.ResponseWriter, r *http.Request, u *User) {
+	if !u.canSeeAll() {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "需要全量权限的管理员"})
+		return
+	}
+	id := r.PathValue("id")
+	if id == u.ID {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "不能轮换自己"})
+		return
+	}
+	var fresh *User
+	upd, err := a.st.updateUser(id, func(x *User) error {
+		x.Token = newToken()
+		return nil
+	})
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "账号不存在"})
+		return
+	}
+	fresh = upd
+	a.st.appendAudit(&Audit{Actor: u.ID, Label: u.Label, Action: "user.rotate", Target: id + ":" + upd.Label})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id": fresh.ID, "label": fresh.Label, "link": a.linkFor(fresh), "token": fresh.Token,
+	})
+}
+
+func (a *app) deleteUser(w http.ResponseWriter, r *http.Request, u *User) {
+	if !u.canSeeAll() {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "需要全量权限的管理员"})
+		return
+	}
+	id := r.PathValue("id")
+	if id == u.ID {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "不能删除自己"})
+		return
+	}
+	if err := a.st.removeUser(id); err != nil {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		return
+	}
+	a.st.appendAudit(&Audit{Actor: u.ID, Label: u.Label, Action: "user.delete", Target: id})
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (a *app) auditLog(w http.ResponseWriter, r *http.Request, u *User) {
+	if !u.canSeeAll() {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "需要全量权限的管理员"})
+		return
+	}
+	writeJSON(w, http.StatusOK, a.st.audit(100))
 }
 
 func (a *app) createSlot(w http.ResponseWriter, r *http.Request, u *User) {
@@ -685,12 +1022,16 @@ func (a *app) createSlot(w http.ResponseWriter, r *http.Request, u *User) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "写入失败"})
 		return
 	}
+	a.st.appendAudit(&Audit{Actor: u.ID, Label: u.Label, Action: "slot.create", Slot: sl.ID, Target: m.Label})
 	writeJSON(w, http.StatusOK, sl)
 }
 
 func (a *app) patchSlot(w http.ResponseWriter, r *http.Request, u *User) {
 	if u.Role != "admin" {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "仅管理员"})
+		return
+	}
+	if a.guardSlot(w, u, r.PathValue("id")) == nil {
 		return
 	}
 	var body struct {
@@ -776,12 +1117,20 @@ func (a *app) patchSlot(w http.ResponseWriter, r *http.Request, u *User) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "槽位不存在"})
 		return
 	}
+	action := "slot.update"
+	if body.Member != nil {
+		action = "slot.reassign"
+	}
+	a.st.appendAudit(&Audit{Actor: u.ID, Label: u.Label, Action: action, Slot: sl.ID})
 	writeJSON(w, http.StatusOK, sl)
 }
 
 func (a *app) clearSlot(w http.ResponseWriter, r *http.Request, u *User) {
 	if u.Role != "admin" {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "仅管理员"})
+		return
+	}
+	if a.guardSlot(w, u, r.PathValue("id")) == nil {
 		return
 	}
 	sl, err := a.st.updateSlot(r.PathValue("id"), func(s *Slot) error {
@@ -792,6 +1141,7 @@ func (a *app) clearSlot(w http.ResponseWriter, r *http.Request, u *User) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "槽位不存在"})
 		return
 	}
+	a.st.appendAudit(&Audit{Actor: u.ID, Label: u.Label, Action: "slot.clear", Slot: sl.ID})
 	writeJSON(w, http.StatusOK, sl)
 }
 
@@ -808,10 +1158,14 @@ func (a *app) deleteSlot(w http.ResponseWriter, r *http.Request, u *User) {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "仅管理员"})
 		return
 	}
+	if a.guardSlot(w, u, r.PathValue("id")) == nil {
+		return
+	}
 	if err := a.st.removeSlot(r.PathValue("id")); err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "槽位不存在"})
 		return
 	}
+	a.st.appendAudit(&Audit{Actor: u.ID, Label: u.Label, Action: "slot.delete", Slot: r.PathValue("id")})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -962,6 +1316,7 @@ func (a *app) report(w http.ResponseWriter, r *http.Request, u *User) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "保存失败"})
 		return
 	}
+	a.st.appendAudit(&Audit{Actor: u.ID, Label: u.Label, Action: "slot.report", Slot: updated.ID})
 	writeJSON(w, http.StatusOK, updated)
 }
 

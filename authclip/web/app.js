@@ -273,19 +273,21 @@ function memberPanel() {
   };
   const list = (state.board.members || []).map((m) => {
     const shown = state.reveal.has(m.id);
+    const noLink = !m.link; // own 范围管理员拿不到接收人链接
     return el("div", { class: "member-row" },
       el("span", { class: "name", text: m.label }),
-      mono(shown ? m.link : maskLink(m.link)),
+      m.revoked ? el("span", { class: "badge warn", text: "已吊销" }) : null,
+      noLink ? mono("（无权限查看链接）") : mono(shown ? m.link : maskLink(m.link)),
       el("span", { class: "grow" }),
-      el("button", {
+      noLink ? null : el("button", {
         type: "button", text: shown ? "隐藏" : "显示",
         onclick: () => {
           if (shown) state.reveal.delete(m.id); else state.reveal.add(m.id);
           render();
         },
       }),
-      el("button", { type: "button", text: "复制长期链接", onclick: () => copy(m.link, "长期链接已复制") }),
-      el("a", { class: "btn", href: m.link, target: "_blank", rel: "noopener noreferrer", text: "打开" }),
+      noLink ? null : el("button", { type: "button", text: "复制长期链接", onclick: () => copy(m.link, "长期链接已复制") }),
+      noLink ? null : el("a", { class: "btn", href: m.link, target: "_blank", rel: "noopener noreferrer", text: "打开" }),
     );
   });
 
@@ -299,6 +301,119 @@ function memberPanel() {
     el("p", { class: "hint", text: "这条链接长期有效、无需登录：转发即等于授权，务必只给对应的人。" }),
   );
 }
+
+// ---------------------------------------------------------------- 账号与权限
+
+async function userAction(path, opts, okText) {
+  try {
+    await api(path, opts);
+    flash(okText);
+    await refresh();
+  } catch (e) {
+    flash(e.message, "err");
+  }
+}
+
+function usersPanel() {
+  if (!state.board.users) return null; // 只有 all 范围管理员能拿到
+
+  const rows = state.board.users.map((u) => {
+    const role = u.role === "admin" ? (u.scope === "own" ? "管理员·限自己" : "管理员·全量") : "接收人";
+    return el("div", { class: "member-row" },
+      el("span", { class: "name", text: u.label || "未命名" }),
+      el("span", { class: "chip", text: role }),
+      u.revoked ? el("span", { class: "badge warn", text: "已吊销" }) : el("span", { class: "badge filled", text: "有效" }),
+      u.self ? el("span", { class: "badge", text: "当前账号" }) : null,
+      el("span", { class: "grow" }),
+      el("button", {
+        type: "button", text: "轮换链接", disabled: u.self,
+        onclick: async () => {
+          try {
+            const r = await api(`/api/users/${u.id}/rotate`, { method: "POST", body: {} });
+            await copy(r.link, "新链接已生成并复制（旧链接立即失效）");
+            await refresh();
+          } catch (e) { flash(e.message, "err"); }
+        },
+      }),
+      el("button", {
+        type: "button", text: u.revoked ? "恢复" : "吊销", disabled: u.self,
+        onclick: () => userAction(`/api/users/${u.id}`, { method: "PATCH", body: { revoke: !u.revoked } },
+          u.revoked ? "已恢复访问" : "已吊销，链接立即失效"),
+      }),
+      u.role === "admin" ? el("button", {
+        type: "button", text: u.scope === "own" ? "提为全量" : "降为限自己", disabled: u.self,
+        onclick: () => userAction(`/api/users/${u.id}`, { method: "PATCH", body: { scope: u.scope === "own" ? "all" : "own" } },
+          "权限范围已更新"),
+      }) : null,
+      el("button", {
+        type: "button", class: "danger", text: "删除", disabled: u.self,
+        onclick: () => userAction(`/api/users/${u.id}`, { method: "DELETE" }, "已删除"),
+      }),
+    );
+  });
+
+  const roleSel = el("select", {},
+    el("option", { value: "member", text: "接收人" }),
+    el("option", { value: "admin", text: "管理员" }),
+  );
+  const scopeSel = el("select", {},
+    el("option", { value: "own", text: "只能管自己创建的任务" }),
+    el("option", { value: "all", text: "全量（含账号与审计）" }),
+  );
+  const scopeWrap = el("div", { class: "grow" }, el("label", {}, "管理员范围", scopeSel));
+  const toggleScope = () => { scopeWrap.hidden = roleSel.value !== "admin"; };
+  roleSel.addEventListener("change", toggleScope);
+  toggleScope();
+
+  const labelInput = el("input", { maxlength: 40, placeholder: "名字" });
+  const create = async (event) => {
+    event.preventDefault();
+    if (state.busy) return;
+    state.busy = true;
+    try {
+      const r = await api("/api/users", {
+        body: { role: roleSel.value, scope: scopeSel.value, label: labelInput.value },
+      });
+      await copy(r.link, "已创建，长期链接已复制（只显示这一次）");
+      await refresh();
+    } catch (e) {
+      flash(e.message, "err");
+    } finally {
+      state.busy = false;
+    }
+  };
+
+  return el("div", { class: "card stack" },
+    el("h2", { text: "账号与权限" }),
+    el("div", { class: "members" }, rows.length ? rows : el("p", { class: "hint", text: "只有当前账号。" })),
+    el("form", { class: "row", onsubmit: create },
+      el("div", { class: "grow" }, el("label", {}, "角色", roleSel)),
+      scopeWrap,
+      el("div", { class: "grow" }, el("label", {}, "名字", labelInput)),
+      el("button", { class: "primary", type: "submit", text: "创建", disabled: state.busy }),
+    ),
+    el("p", { class: "hint", text: "「限自己」的管理员只能看/管自己下发的任务，也拿不到接收人的长期链接；轮换与吊销会立即让对方当前链接失效。" }),
+  );
+}
+
+function auditPanel() {
+  if (!state.board.audit) return null;
+  const rows = state.board.audit.slice(0, 12).map((a) =>
+    el("div", { class: "member-row" },
+      el("span", { class: "hint", text: timeLabel(a.at) }),
+      el("span", { class: "chip", text: a.action }),
+      el("span", { class: "name", text: a.label || a.actor.slice(0, 6) }),
+      a.slot ? mono(`#${a.slot}`) : null,
+      a.target ? mono(a.target) : null,
+    ),
+  );
+  return el("div", { class: "card stack" },
+    el("h2", { text: "操作审计（最近 12 条）" }),
+    el("div", { class: "members" }, rows.length ? rows : el("p", { class: "hint", text: "暂无操作。" })),
+    el("p", { class: "hint", text: "只记录「谁对哪条任务做了什么」，不含凭证内容。" }),
+  );
+}
+
 
 function adminSlotCard(slot) {
   const member = (state.board.members || []).find((m) => m.id === slot.member);
@@ -439,8 +554,10 @@ function adminView() {
     feedbackLine(),
     newSlotForm(),
     memberPanel(),
+    usersPanel(),
     slots.length ? el("div", { class: "stack" }, slots.map(adminSlotCard))
       : el("div", { class: "card" }, el("p", { class: "muted", text: "还没有下发授权链接。" })),
+    auditPanel(),
   );
 }
 

@@ -230,3 +230,55 @@ go version -m authclip.exe → go1.27.4
 
 > 注意：`govulncheck` 按**实际构建用的工具链**判定。审查环境若用 1.27.0~1.27.3 编译，
 > 即使 `go.mod` 写 1.27.4 也会命中；CI 需确认 `go version` 输出。
+
+## 十二、账号、权限分发与审计（v1.2.0）
+
+之前的模型只有「管理员 / 接收人」两层，建号只能靠 CLI，也没有吊销和留痕。v1.2 补齐：
+
+### 三种身份
+
+| 身份 | 范围 | 能做什么 | 看不到什么 |
+| :--- | :--- | :--- | :--- |
+| 接收人 `member` | — | 只看到派给自己的任务；提交/覆盖回传 | 别人的任务、任何人的链接 |
+| 管理员·限自己 `admin/own` | 自己创建的任务 | 下发、改派、清空、删除**自己名下**任务；创建接收人 | 别人的任务、接收人的长期链接、账号列表、审计 |
+| 管理员·全量 `admin/all` | 全部 | 全部任务 + 账号管理 + 轮换/吊销 + 审计 | — |
+
+`scope` 为空的历史管理员按 `all` 处理（向后兼容）。
+
+### 账号管理接口（均需 `all`）
+
+| 方法 | 路径 | 说明 |
+| :--- | :--- | :--- |
+| GET | `/api/users` | 列账号（含角色/范围/吊销状态） |
+| POST | `/api/users` | 建账号 `{role,scope,label}`，**长期链接只在这里返回一次** |
+| PATCH | `/api/users/{id}` | 改标签 / 改范围 / 吊销 `{revoke:true|false}` |
+| POST | `/api/users/{id}/rotate` | 轮换长期链接，**旧链接立即失效** |
+| DELETE | `/api/users/{id}` | 删除（名下还有任务时拒绝） |
+| GET | `/api/audit` | 最近 100 条操作 |
+
+保护规则：不能吊销/删除自己；`own` 管理员不能改自己的范围、不能升自己为全量。
+
+### 命令行的范围参数
+
+```sh
+authclip -dir ./data add admin "A-主号" all     # 默认 all
+authclip -dir ./data add admin "A2-外包" own    # 只能管自己下发的
+authclip -dir ./data add member "B1-家宽"
+authclip -dir ./data users                      # 显示 role / scope / id / 标签 / 是否吊销
+```
+
+### 审计
+
+每次 `slot.create / slot.reassign / slot.update / slot.clear / slot.delete / slot.report`
+以及 `user.create / user.update / user.revoke / user.restore / user.rotate / user.delete`
+都会写一条 `{时间, 操作者 id+标签, 动作, 任务, 对象}`，**不含凭证内容**；最多保留 500 条。
+
+### 权限相关的测试
+
+```
+PASS TestOwnScopeAdminIsIsolated   限自己管理员：看不到他人任务/链接/账号/审计，改他人任务 404
+PASS TestRevokedLinkStopsWorking   吊销后 401，恢复后 200
+PASS TestRotateInvalidatesOldToken 轮换后旧 token 失效、新 token 可用
+PASS TestSelfProtection            不能吊销/删除自己
+PASS TestAuditTrail                审计里能查到 slot.create / slot.reassign
+```

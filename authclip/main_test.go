@@ -37,12 +37,12 @@ func newEnv(t *testing.T, secret string) *env {
 		t.Fatalf("openStore: %v", err)
 	}
 	a := &app{st: st}
-	admin, err := st.addUser("admin", "A")
+	admin, err := st.addUser("admin", "all", "A")
 	if err != nil {
 		t.Fatal(err)
 	}
-	b1, _ := st.addUser("member", "B1")
-	b2, _ := st.addUser("member", "B2")
+	b1, _ := st.addUser("member", "", "B1")
+	b2, _ := st.addUser("member", "", "B2")
 
 	h, err := a.routes()
 	if err != nil {
@@ -185,7 +185,7 @@ func TestStoreEncryptionAtRest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	u, err := st.addUser("admin", "A")
+	u, err := st.addUser("admin", "all", "A")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -226,3 +226,140 @@ func TestLinkStateParsing(t *testing.T) {
 		t.Fatal("授权链接被误判为回调链接")
 	}
 }
+
+// ---------------------------------------------------------------- 权限与账号
+
+func TestOwnScopeAdminIsIsolated(t *testing.T) {
+	e := newEnv(t, "")
+	// 另一个「限自己」的管理员
+	own, err := e.app.st.addUser("admin", "own", "A2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 全量管理员下发一条任务，挂在他的名下
+	code, out := e.call(t, "POST", "/api/slots", e.admin.Token, map[string]any{
+		"member": e.b1.ID, "link": testLink, "label": "by-A",
+	})
+	if code != http.StatusOK {
+		t.Fatalf("create: %d %v", code, out)
+	}
+	id := out["id"].(string)
+
+	// A2 的看板：看不到这条任务
+	code, board := e.call(t, "GET", "/api/board", own.Token, nil)
+	if code != http.StatusOK {
+		t.Fatalf("board: %d", code)
+	}
+	if slots, _ := board["slots"].([]any); len(slots) != 0 {
+		t.Fatalf("限自己的管理员看到了别人的任务：%d 条", len(slots))
+	}
+	// 也拿不到接收人的长期链接（token）
+	for _, m := range board["members"].([]any) {
+		if _, hasToken := m.(map[string]any)["token"]; hasToken {
+			t.Fatal("限自己的管理员拿到了接收人 token")
+		}
+	}
+	// 账号与审计接口：403
+	if code, _ := e.call(t, "GET", "/api/users", own.Token, nil); code != http.StatusForbidden {
+		t.Fatalf("限自己的管理员能列账号：%d", code)
+	}
+	if code, _ := e.call(t, "GET", "/api/audit", own.Token, nil); code != http.StatusForbidden {
+		t.Fatalf("限自己的管理员能看审计：%d", code)
+	}
+	// 动别人的任务：404
+	for _, tc := range []struct{ method, path string }{
+		{"PATCH", "/api/slots/" + id},
+		{"POST", "/api/slots/" + id + "/clear"},
+		{"DELETE", "/api/slots/" + id},
+	} {
+		if c, _ := e.call(t, tc.method, tc.path, own.Token, map[string]any{"label": "x"}); c != http.StatusNotFound {
+			t.Fatalf("%s %s 应 404，实际 %d", tc.method, tc.path, c)
+		}
+	}
+	// 自己下发的任务则能管
+	code, out = e.call(t, "POST", "/api/slots", own.Token, map[string]any{
+		"member": e.b1.ID, "link": testLink, "label": "by-A2",
+	})
+	if code != http.StatusOK {
+		t.Fatalf("own 管理员无法下发：%d %v", code, out)
+	}
+	if c, _ := e.call(t, "PATCH", "/api/slots/"+out["id"].(string), own.Token, map[string]any{"label": "y"}); c != http.StatusOK {
+		t.Fatalf("own 管理员无法改自己的任务：%d", c)
+	}
+}
+
+func TestRevokedLinkStopsWorking(t *testing.T) {
+	e := newEnv(t, "")
+	if code, _ := e.call(t, "GET", "/api/mine", e.b1.Token, nil); code != http.StatusOK {
+		t.Fatalf("吊销前应可用：%d", code)
+	}
+	if code, out := e.call(t, "PATCH", "/api/users/"+e.b1.ID, e.admin.Token, map[string]any{"revoke": true}); code != http.StatusOK {
+		t.Fatalf("吊销失败：%d %v", code, out)
+	}
+	if code, _ := e.call(t, "GET", "/api/mine", e.b1.Token, nil); code != http.StatusUnauthorized {
+		t.Fatalf("吊销后应 401，实际 %d", code)
+	}
+	// 恢复后又能用
+	if code, _ := e.call(t, "PATCH", "/api/users/"+e.b1.ID, e.admin.Token, map[string]any{"revoke": false}); code != http.StatusOK {
+		t.Fatal("恢复失败")
+	}
+	if code, _ := e.call(t, "GET", "/api/mine", e.b1.Token, nil); code != http.StatusOK {
+		t.Fatalf("恢复后应 200，实际 %d", code)
+	}
+}
+
+func TestRotateInvalidatesOldToken(t *testing.T) {
+	e := newEnv(t, "")
+	code, out := e.call(t, "POST", "/api/users/"+e.b1.ID+"/rotate", e.admin.Token, map[string]any{})
+	if code != http.StatusOK {
+		t.Fatalf("轮换失败：%d %v", code, out)
+	}
+	if code, _ := e.call(t, "GET", "/api/mine", e.b1.Token, nil); code != http.StatusUnauthorized {
+		t.Fatalf("旧链接应失效，实际 %d", code)
+	}
+	newTok := out["token"].(string)
+	if code, _ := e.call(t, "GET", "/api/mine", newTok, nil); code != http.StatusOK {
+		t.Fatalf("新链接应可用，实际 %d", code)
+	}
+}
+
+func TestSelfProtection(t *testing.T) {
+	e := newEnv(t, "")
+	if code, _ := e.call(t, "PATCH", "/api/users/"+e.admin.ID, e.admin.Token, map[string]any{"revoke": true}); code != http.StatusBadRequest {
+		t.Fatalf("应禁止吊销自己，实际 %d", code)
+	}
+	if code, _ := e.call(t, "DELETE", "/api/users/"+e.admin.ID, e.admin.Token, nil); code != http.StatusBadRequest {
+		t.Fatalf("应禁止删除自己，实际 %d", code)
+	}
+}
+
+func TestAuditTrail(t *testing.T) {
+	e := newEnv(t, "")
+	id := e.newSlot(t, e.b1)
+	if _, out := e.call(t, "PATCH", "/api/slots/"+id, e.admin.Token, map[string]any{"member": e.b2.ID}); out == nil {
+		t.Fatal("reassign failed")
+	}
+	req, _ := http.NewRequest("GET", e.srv.URL+"/api/audit", nil)
+	req.Header.Set("X-Token", e.admin.Token)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("audit: %d", res.StatusCode)
+	}
+	var rows []map[string]any
+	if err := json.NewDecoder(res.Body).Decode(&rows); err != nil {
+		t.Fatalf("audit decode: %v", err)
+	}
+	var actions []string
+	for _, r := range rows {
+		actions = append(actions, r["action"].(string))
+	}
+	joined := strings.Join(actions, ",")
+	if !strings.Contains(joined, "slot.create") || !strings.Contains(joined, "slot.reassign") {
+		t.Fatalf("审计缺少动作：%s", joined)
+	}
+}
+
