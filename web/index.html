@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="robots" content="noindex,nofollow,noarchive">
+    <meta name="color-scheme" content="light">
+    <title>Access desk</title>
+    <link rel="stylesheet" href="/style.css">
+    <script src="/app.mjs" type="module"></script>
+  </head>
+  <body>
+    <header class="masthead">
+      <div class="masthead-inner">
+        <a class="brand" href="/" id="home">
+          <span class="brand-mark" aria-hidden="true"></span>
+          <span id="brand">Access desk</span>
+        </a>
+        <div class="header-actions">
+          <label class="language">
+            <span id="language-label">Language</span>
+            <select id="language"></select>
+          </label>
+          <button type="button" id="logout" class="quiet" hidden></button>
+        </div>
+      </div>
+    </header>
+    <main id="content" class="shell" aria-busy="true"></main>
+  </body>
+</html>

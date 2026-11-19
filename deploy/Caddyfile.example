@@ -1,0 +1,8 @@
+portal.example.com {
+	@pocketbaseDashboard path /_ /_/*
+	respond @pocketbaseDashboard 404
+
+	reverse_proxy 127.0.0.1:8090 {
+		header_up X-Real-IP {remote_host}
+	}
+}
