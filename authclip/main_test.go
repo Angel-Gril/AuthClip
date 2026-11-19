@@ -999,3 +999,53 @@ func TestReportRejectedAfterRelinkEvenWithSameState(t *testing.T) {
 		t.Fatalf("缺 link_gen 应 400，实际 %d", c)
 	}
 }
+
+// v1.4.6：轮换必须原子（换令牌 + 审计一次落盘）
+func TestRotateIsAtomicOnWriteFailure(t *testing.T) {
+	e := newEnv(t, "")
+	before := e.app.st.userByID(e.b1.ID).Token
+
+	// 让落盘失败
+	e.app.st.mu.Lock()
+	orig := e.app.st.path
+	bad := filepath.Join(filepath.Dir(orig), "rotate-dir")
+	_ = os.MkdirAll(bad, 0o700)
+	e.app.st.path = bad
+	e.app.st.mu.Unlock()
+	t.Cleanup(func() {
+		e.app.st.mu.Lock()
+		e.app.st.path = orig
+		e.app.st.mu.Unlock()
+		_ = os.RemoveAll(bad)
+	})
+
+	code, body := e.call(t, "POST", "/api/users/"+e.b1.ID+"/rotate", e.admin.Token, map[string]any{})
+	if code != http.StatusInternalServerError {
+		t.Fatalf("写盘失败应 500，实际 %d %v", code, body)
+	}
+	if _, has := body["link"]; has {
+		t.Fatal("失败时不应返回新链接")
+	}
+
+	// 关键：旧令牌必须仍然有效（不能出现"旧链接失效、新链接没交付"）
+	e.app.st.mu.Lock()
+	e.app.st.path = orig
+	e.app.st.mu.Unlock()
+	if after := e.app.st.userByID(e.b1.ID).Token; after != before {
+		t.Fatalf("令牌被改动：%q -> %q", before, after)
+	}
+	if c, _ := e.call(t, "GET", "/api/mine", e.b1.Token, nil); c != http.StatusOK {
+		t.Fatalf("旧链接应仍然可用，实际 %d", c)
+	}
+	// 审计里也不该留下半条记录
+	for _, r := range e.app.st.audit(50) {
+		if r.Action == "user.rotate" {
+			t.Fatal("失败的轮换不应留下审计")
+		}
+	}
+
+	// 恢复正常后再轮换应当成功
+	if c, out := e.call(t, "POST", "/api/users/"+e.b1.ID+"/rotate", e.admin.Token, map[string]any{}); c != http.StatusOK {
+		t.Fatalf("恢复后轮换失败：%d %v", c, out)
+	}
+}

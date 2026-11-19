@@ -603,3 +603,39 @@ GET /api/users/<接收人>/link -> 200 http://…/#b=…
 PASS TestReportRejectedAfterRelinkEvenWithSameState  同 state 换链后旧代次 409、新代次 200、缺 link_gen 400
 PASS TestAdminLinkNotReadableButRotatable             管理员链接 403，接收人 200，轮换仍可用
 ```
+
+## 二十二、v1.4.6：草稿随链接作废 / 轮换原子化
+
+### 1. 实时刷新把旧草稿当新一轮提交
+
+- **问题**：`link_gen` 只在服务端生效。B 的浏览器按任务 ID 缓存草稿；换链推送到达后页面刷新，`slot.link_gen` 变成新值，而草稿里的回调链接还是旧的——提交时带上的是**新**代次，服务端校验通过。若新旧链接沿用同一 state，`state` 校验也通过，旧回传就"洗白"了。
+- **修复**：草稿里记录**生成时的代次** `gen`；每次 `/api/mine` 刷新后，凡 `draft.gen != slot.link_gen` 的草稿一律丢弃，并提示「授权链接已更新，之前的草稿已清空」。提交时用的是**草稿自己的代次**，不是页面当下的代次。
+
+实测（浏览器内）：
+
+```
+输入草稿 -> 值 = http://localhost:54545/callback?code=STALE_DRAFT&state=SAME
+A 端换链（state 不变，gen 1 -> 2）
+页面收到推送后：
+  textarea = ""
+  提示 = 授权链接已更新，之前的草稿已清空，请重新粘贴回调链接。
+```
+
+### 2. 轮换时审计失败会让账号失去访问
+
+- **问题**：原实现「先保存新令牌（旧链接失效）→ 再写审计」，第二步失败就返回 500：操作者拿不到新链接，账号两头落空。
+- **修复**：抽出 `rotateUserToken()`，把**换令牌 + 写审计放进同一次落盘**；任一失败整体回滚（令牌复原、审计记录撤回），返回「轮换未生效，旧链接保持不变，可稍后重试」。
+
+实测（测试内把存储路径改成目录制造写失败）：
+
+```
+POST /rotate -> 500 且响应不含 link
+令牌未变；旧链接仍可访问；审计里没有半条 user.rotate
+恢复写盘后再次 rotate -> 200
+```
+
+### 测试（共 28 个）
+
+```
+PASS TestRotateIsAtomicOnWriteFailure  写失败时令牌不变、旧链接可用、无残留审计
+```

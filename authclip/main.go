@@ -55,7 +55,7 @@ const (
 	maxBody    = 128 << 10
 	maxLink    = 8192
 	sessionEC  = 20 * time.Second
-	appVersion = "v1.4.5" // v1.4.4: 错配拦截｜v1.4.5: 链接代次防并发写回 / 管理员链接不可读
+	appVersion = "v1.4.6" // v1.4.5: 链接代次｜v1.4.6: 换链作废浏览器草稿 / 轮换原子落盘
 )
 
 // ---------------------------------------------------------------- 模型
@@ -404,6 +404,35 @@ func (s *store) userByUsername(name string) *User {
 		}
 	}
 	return nil
+}
+
+// rotateUserToken：换令牌 + 写审计在同一次落盘里完成。
+// 任一步失败都整体回滚，绝不允许出现「旧链接已失效、审计没写、新链接也没交付」。
+func (s *store) rotateUserToken(id string, actor *User) (*User, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, u := range s.d.Users {
+		if u.ID != id {
+			continue
+		}
+		prev := *u
+		prevAudit := len(s.d.Audit)
+		u.Token = newToken()
+		s.d.Audit = append(s.d.Audit, &Audit{
+			At: time.Now().UTC(), Actor: actor.ID, Label: actor.Label,
+			Action: "user.rotate", Target: u.ID + ":" + u.Label + ":" + u.Role,
+		})
+		if err := s.saveLocked(); err != nil {
+			*u = prev
+			s.d.Audit = s.d.Audit[:prevAudit]
+			return nil, err
+		}
+		cp := *u
+		s.notifyLocked("admin")
+		s.notifyLocked("u:" + u.ID)
+		return &cp, nil
+	}
+	return nil, os.ErrNotExist
 }
 
 func (s *store) updateUser(id string, fn func(*User) error) (*User, error) {
@@ -1270,17 +1299,16 @@ func (a *app) rotateUser(w http.ResponseWriter, r *http.Request, u *User) {
 		return
 	}
 	var fresh *User
-	upd, err := a.st.updateUser(id, func(x *User) error {
-		x.Token = newToken()
-		return nil
-	})
-	if err != nil {
+	fresh, err := a.st.rotateUserToken(id, u)
+	if errors.Is(err, os.ErrNotExist) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "账号不存在"})
 		return
 	}
-	fresh = upd
-	if err := a.st.appendAudit(&Audit{Actor: u.ID, Label: u.Label, Action: "user.rotate", Target: id + ":" + upd.Label}); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "已轮换但审计写入失败，请检查磁盘"})
+	if err != nil {
+		// 原子写入失败 = 什么都没改：旧链接仍然有效，可以安全重试
+		writeJSON(w, http.StatusInternalServerError, map[string]string{
+			"error": "轮换未生效（写入失败），旧链接保持不变，可稍后重试",
+		})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -2059,6 +2087,7 @@ func plausibleURL(s string) bool {
 	}
 	return host != "" && !strings.ContainsAny(host, " \t\r\n")
 }
+
 
 
 

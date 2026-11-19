@@ -153,12 +153,32 @@ function stopStream() {
   state.stopStream = null;
 }
 
+// 换链接后，按任务 ID 存的旧草稿必须作废：
+// 否则刷新拿到新 link_gen 再把旧回调提交上去，等于替上一轮数据"洗白"。
+function dropStaleDrafts() {
+  const slots = state.mine.slots || [];
+  const gen = new Map(slots.map((s) => [s.id, s.link_gen ?? 0]));
+  let dropped = 0;
+  for (const [id, d] of state.drafts) {
+    const live = gen.get(id);
+    if (live === undefined || (d.gen ?? 0) !== live) {
+      state.drafts.delete(id);
+      dropped++;
+    }
+  }
+  if (dropped > 0) {
+    state.feedback = "授权链接已更新，之前的草稿已清空，请重新粘贴回调链接。";
+    state.feedbackKind = "err";
+  }
+}
+
 async function refresh() {
   try {
     if (state.role === "admin") {
       state.board = await api("/api/board");
     } else {
       state.mine = await api("/api/mine");
+      dropStaleDrafts();
     }
   } catch (e) {
     if (e.status === 401) {
@@ -818,6 +838,7 @@ function memberCard(slot) {
   }
 
   const draft = state.drafts.get(slot.id) || {
+    gen: slot.link_gen ?? 0,
     email: slot.email || "",
     callback: slot.callback || "",
     regIp: slot.reg_ip || state.mine.seen?.ip || "",
@@ -895,7 +916,7 @@ function memberCard(slot) {
           reg_ip: regIp.value,
           reg_region: regRegion.value,
           node_ip: nodeIp.value,
-          link_gen: slot.link_gen ?? 0,
+          link_gen: draft.gen ?? slot.link_gen ?? 0,
         },
       });
       state.drafts.delete(slot.id);
@@ -1090,6 +1111,7 @@ window.addEventListener("focus", () => {
 });
 
 void start();
+
 
 
 
