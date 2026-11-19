@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -250,7 +251,7 @@ func TestOwnScopeAdminIsIsolated(t *testing.T) {
 	if code != http.StatusOK {
 		t.Fatalf("board: %d", code)
 	}
-	if slots, _ := board["slots"].([]any); len(slots) != 0 {
+	if slots := asSlice(board["slots"]); len(slots) != 0 {
 		t.Fatalf("限自己的管理员看到了别人的任务：%d 条", len(slots))
 	}
 	// 也拿不到接收人的长期链接（token）
@@ -363,3 +364,109 @@ func TestAuditTrail(t *testing.T) {
 	}
 }
 
+
+func TestArchiveKeepsMemberHistory(t *testing.T) {
+	e := newEnv(t, "")
+	id := e.newSlot(t, e.b1)
+	cb := "http://localhost:54545/callback?code=ARCH1&state=STATE-ONE"
+	if code, _ := e.call(t, "POST", "/api/slots/"+id+"/report", e.b1.Token, map[string]any{"email": "b1@example.com", "callback": cb}); code != http.StatusOK {
+		t.Fatalf("report: %d", code)
+	}
+	// 管理员归档
+	if code, _ := e.call(t, "DELETE", "/api/slots/"+id, e.admin.Token, nil); code != http.StatusOK {
+		t.Fatalf("archive: %d", code)
+	}
+	// 看板不再显示
+	if _, board := e.call(t, "GET", "/api/board", e.admin.Token, nil); len(asSlice(board["slots"])) != 0 {
+		t.Fatal("归档后看板仍显示")
+	}
+	// B 的历史里仍在，且带 deleted 标记
+	_, mine := e.call(t, "GET", "/api/mine", e.b1.Token, nil)
+	slots := asSlice(mine["slots"])
+	if len(slots) != 1 {
+		t.Fatalf("B 的历史应有 1 条，实际 %d", len(slots))
+	}
+	s := slots[0].(map[string]any)
+	if s["deleted"] != true || s["code"] != "ARCH1" {
+		t.Fatalf("历史内容不对：%v", s)
+	}
+	// 归档后不能再回传
+	if code, _ := e.call(t, "POST", "/api/slots/"+id+"/report", e.b1.Token, map[string]any{"email": "b1@example.com", "callback": cb}); code == http.StatusOK {
+		t.Fatal("归档任务仍可回传")
+	}
+}
+
+func TestPurgeOnlyForAllScope(t *testing.T) {
+	e := newEnv(t, "")
+	id := e.newSlot(t, e.b1)
+	e.call(t, "DELETE", "/api/slots/"+id, e.admin.Token, nil)
+
+	own, _ := e.app.st.addUser("admin", "own", "A2")
+	// 限自己的管理员不能彻底删除
+	if code, _ := e.call(t, "DELETE", "/api/slots/"+id+"?purge=1", own.Token, nil); code != http.StatusNotFound {
+		t.Fatalf("own 访问他人任务应 404，实际 %d", code)
+	}
+	// 全量可以
+	if code, _ := e.call(t, "DELETE", "/api/slots/"+id+"?purge=1", e.admin.Token, nil); code != http.StatusOK {
+		t.Fatalf("purge: %d", code)
+	}
+	_, mine := e.call(t, "GET", "/api/mine", e.b1.Token, nil)
+	if len(asSlice(mine["slots"])) != 0 {
+		t.Fatal("彻底删除后 B 的历史仍可见")
+	}
+}
+
+func TestOwnScopeCannotCreateMember(t *testing.T) {
+	e := newEnv(t, "")
+	own, _ := e.app.st.addUser("admin", "own", "A2")
+	if code, _ := e.call(t, "POST", "/api/members", own.Token, map[string]any{"label": "B3"}); code != http.StatusForbidden {
+		t.Fatalf("限自己的管理员能建接收人：%d", code)
+	}
+	if code, _ := e.call(t, "POST", "/api/members", e.admin.Token, map[string]any{"label": "B3"}); code != http.StatusOK {
+		t.Fatalf("全量管理员建接收人失败：%d", code)
+	}
+}
+
+func TestExportCSV(t *testing.T) {
+	e := newEnv(t, "")
+	id := e.newSlot(t, e.b1)
+	e.call(t, "POST", "/api/slots/"+id+"/report", e.b1.Token, map[string]any{
+		"email": "b1@example.com", "callback": "http://localhost:54545/callback?code=EXP1&state=STATE-ONE",
+	})
+	e.call(t, "DELETE", "/api/slots/"+id, e.admin.Token, nil) // 归档的也要出现在导出里
+
+	req, _ := http.NewRequest("GET", e.srv.URL+"/api/export?format=csv", nil)
+	req.Header.Set("X-Token", e.admin.Token)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("export: %d", res.StatusCode)
+	}
+	if ct := res.Header.Get("Content-Type"); !strings.Contains(ct, "csv") {
+		t.Fatalf("content-type: %s", ct)
+	}
+	raw, _ := io.ReadAll(res.Body)
+	body := string(raw)
+	for _, want := range []string{"EXP1", "b1@example.com", "已归档"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("导出缺少 %q：\n%s", want, body)
+		}
+	}
+	// 限自己的管理员不能导出
+	own, _ := e.app.st.addUser("admin", "own", "A2")
+	if code, _ := e.call(t, "GET", "/api/export?format=csv", own.Token, nil); code != http.StatusForbidden {
+		t.Fatalf("own 能导出：%d", code)
+	}
+}
+
+
+// asSlice：JSON 里 null 与 [] 都安全处理
+func asSlice(v any) []any {
+	if s, ok := v.([]any); ok {
+		return s
+	}
+	return nil
+}

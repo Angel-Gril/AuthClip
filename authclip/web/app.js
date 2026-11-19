@@ -492,15 +492,25 @@ function adminSlotCard(slot) {
             },
           }),
           el("button", {
-            type: "button", class: "danger", text: "删除",
+            type: "button", text: "归档",
             onclick: async () => {
               try {
                 await api(`/api/slots/${slot.id}`, { method: "DELETE" });
-                flash("已删除");
+                flash("已归档：对方的「历史」里仍可见，看板不再显示");
                 await refresh();
               } catch (e) { flash(e.message, "err"); }
             },
           }),
+          state.board.scope === "all" ? el("button", {
+            type: "button", class: "danger", text: "彻底删除",
+            onclick: async () => {
+              try {
+                await api(`/api/slots/${slot.id}?purge=1`, { method: "DELETE" });
+                flash("已彻底删除（对方历史也一并清除）");
+                await refresh();
+              } catch (e) { flash(e.message, "err"); }
+            },
+          }) : null,
         ),
         edit,
         el("div", { class: "grid-2" },
@@ -544,13 +554,44 @@ function fact(label, value, wide = false) {
   );
 }
 
+// 导出：token 走请求头，用 fetch 拿 blob 再触发下载（<a href> 带不了头）
+async function downloadExport(format) {
+  try {
+    const res = await fetch(`/api/export?format=${format}`, {
+      headers: { "X-Token": state.token }, cache: "no-store",
+    });
+    if (!res.ok) {
+      let msg = `HTTP ${res.status}`;
+      try { msg = (await res.json()).error || msg; } catch { /* 非 JSON */ }
+      throw new Error(msg);
+    }
+    const blob = await res.blob();
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = /filename="([^"]+)"/.exec(res.headers.get("Content-Disposition") || "")?.[1] || `authclip.${format}`;
+    document.body.append(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    flash("已导出（含已归档任务）");
+  } catch (e) {
+    flash(e.message, "err");
+  }
+}
+
 function adminView() {
   const slots = state.board.slots || [];
+  const all = state.board.scope === "all";
   return el("div", { class: "stack" },
     el("div", {},
       el("h1", { text: "授权中继" }),
       el("p", { class: "muted", text: "下发授权链接 → 对方打开并回传凭证 → 这里复制。" }),
     ),
+    all ? el("div", { class: "row" },
+      el("button", { type: "button", text: "导出 CSV", onclick: () => downloadExport("csv") }),
+      el("button", { type: "button", text: "导出 JSON", onclick: () => downloadExport("json") }),
+      el("span", { class: "hint", text: "导出包含已归档任务，可用 Excel 直接打开。" }),
+    ) : null,
     feedbackLine(),
     newSlotForm(),
     memberPanel(),
@@ -646,6 +687,32 @@ async function tryAutoPaste() {
 // ---------------------------------------------------------------- 接收人视图
 
 function memberCard(slot) {
+  // 已归档：只读历史，不再显示表单（链接也可能已失效）
+  if (slot.deleted) {
+    return el("article", { class: "slot" },
+      el("div", { class: "slot-head" },
+        el("div", { class: "row" },
+          el("span", { class: "badge", text: "已结束" }),
+          el("span", { class: "slot-label", text: slot.label || "授权任务" }),
+          el("span", { class: "slot-id", text: `#${slot.id}` }),
+        ),
+        el("span", { class: "muted", text: timeLabel(slot.deleted_at || slot.updated) }),
+      ),
+      el("dl", { class: "facts" },
+        fact("授权链接", slot.link, true),
+        fact("注册邮箱", slot.email),
+        fact("凭证 code", slot.code, true),
+        fact("注册地区", slot.reg_region),
+        fact("注册 IP", slot.reg_ip),
+        fact("节点 IP", slot.node_ip),
+        fact("回传时间", timeLabel(slot.submitted)),
+      ),
+      slot.code ? el("div", { class: "row" },
+        el("button", { type: "button", text: "复制凭证", onclick: () => copy(slot.code, "凭证已复制") }),
+      ) : null,
+    );
+  }
+
   const draft = state.drafts.get(slot.id) || {
     email: slot.email || "",
     callback: slot.callback || "",
@@ -795,7 +862,9 @@ function memberCard(slot) {
 }
 
 function memberView() {
-  const slots = state.mine.slots || [];
+  const all = state.mine.slots || [];
+  const active = all.filter((s) => !s.deleted);
+  const history = all.filter((s) => s.deleted);
   const seen = state.mine.seen || {};
   return el("div", { class: "stack" },
     el("div", {},
@@ -810,9 +879,16 @@ function memberView() {
       el("span", { class: "hint", text: "提交时会自动写入「注册区域 IP / 地区」，也可以自己改。" }),
     ),
     feedbackLine(),
-    slots.length ? copyGuide() : null,
-    slots.length ? el("div", { class: "stack" }, slots.map(memberCard))
-      : el("div", { class: "card" }, el("p", { class: "muted", text: "还没有收到授权任务，等对方下发。" })),
+    active.length ? copyGuide() : null,
+    active.length ? el("div", { class: "stack" }, active.map(memberCard)) : null,
+    !active.length && !history.length
+      ? el("div", { class: "card" }, el("p", { class: "muted", text: "还没有收到授权任务，等对方下发。" }))
+      : null,
+    history.length ? el("div", { class: "stack" },
+      el("h2", { text: "历史（只读）" }),
+      el("p", { class: "hint", text: "对方结束或归档的任务留在这里，方便你回看自己提交过什么。" }),
+      history.map(memberCard),
+    ) : null,
   );
 }
 
@@ -909,4 +985,5 @@ window.addEventListener("focus", () => {
 });
 
 void start();
+
 

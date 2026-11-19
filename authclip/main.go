@@ -24,6 +24,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base32"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -54,7 +55,7 @@ const (
 	maxBody    = 128 << 10
 	maxLink    = 8192
 	sessionEC  = 20 * time.Second
-	appVersion = "v1.2.0" // v1.1.0: 三条阻断项修复｜v1.2.0: 账号管理 / 权限范围 / 吊销轮换 / 审计
+	appVersion = "v1.3.0" // v1.2: 账号/权限/审计｜v1.3: 归档历史 / 导出 / 留存期
 )
 
 // ---------------------------------------------------------------- 模型
@@ -105,6 +106,10 @@ type Slot struct {
 	// 服务端观测（仅 member 提交时写入）
 	SeenIP     string `json:"seen_ip"`
 	SeenRegion string `json:"seen_region"`
+
+	// 归档：A 端删除后从看板消失，但 B 仍能在自己的历史里看到
+	Deleted   bool      `json:"deleted"`
+	DeletedAt time.Time `json:"deleted_at"`
 }
 
 func (s *Slot) filled() bool { return s.Code != "" || s.Email != "" }
@@ -432,7 +437,22 @@ func (s *store) slotsFor(memberID string) []Slot {
 	return out
 }
 
+// allSlots：管理员看板默认不含已归档的
 func (s *store) allSlots() []Slot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]Slot, 0, len(s.d.Slots))
+	for i := len(s.d.Slots) - 1; i >= 0; i-- {
+		if s.d.Slots[i].Deleted {
+			continue
+		}
+		out = append(out, *s.d.Slots[i])
+	}
+	return out
+}
+
+// exportSlots：导出用，含已归档的
+func (s *store) exportSlots() []Slot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := make([]Slot, 0, len(s.d.Slots))
@@ -440,6 +460,27 @@ func (s *store) allSlots() []Slot {
 		out = append(out, *s.d.Slots[i])
 	}
 	return out
+}
+
+// purgeArchived：清掉归档超过 N 天的任务（N=0 表示永不清理）
+func (s *store) purgeArchived(olderThan time.Time) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	kept := s.d.Slots[:0]
+	removed := 0
+	for _, v := range s.d.Slots {
+		if v.Deleted && !v.DeletedAt.IsZero() && v.DeletedAt.Before(olderThan) {
+			removed++
+			continue
+		}
+		kept = append(kept, v)
+	}
+	if removed > 0 {
+		s.d.Slots = kept
+		_ = s.saveLocked()
+		s.notifyLocked("admin")
+	}
+	return removed
 }
 
 func (s *store) slotByID(id string) *Slot {
@@ -480,6 +521,53 @@ func (s *store) updateSlot(id string, fn func(*Slot) error) (*Slot, error) {
 	return nil, os.ErrNotExist
 }
 
+// archiveSlot：软删除——从 A 的看板消失，B 的历史里仍在
+func (s *store) archiveSlot(id string) (*Slot, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, v := range s.d.Slots {
+		if v.ID != id {
+			continue
+		}
+		if v.Deleted {
+			cp := *v
+			return &cp, nil
+		}
+		v.Deleted = true
+		v.DeletedAt = time.Now().UTC()
+		v.Updated = v.DeletedAt
+		if err := s.saveLocked(); err != nil {
+			v.Deleted = false
+			return nil, err
+		}
+		cp := *v
+		s.notifyLocked("admin")
+		s.notifyLocked("u:" + v.Member)
+		return &cp, nil
+	}
+	return nil, os.ErrNotExist
+}
+
+// hardDeleteSlot：彻底删除（含 B 的历史）
+func (s *store) hardDeleteSlot(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i, v := range s.d.Slots {
+		if v.ID != id {
+			continue
+		}
+		m := v.Member
+		s.d.Slots = append(s.d.Slots[:i], s.d.Slots[i+1:]...)
+		if err := s.saveLocked(); err != nil {
+			return err
+		}
+		s.notifyLocked("admin")
+		s.notifyLocked("u:" + m)
+		return nil
+	}
+	return os.ErrNotExist
+}
+
 func (s *store) removeSlot(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -517,6 +605,7 @@ func main() {
 	geoURL := flag.String("geo-url", "", "客户端地域查询端点（可选，例如 https://ip.net.coffee/ ）")
 	base := flag.String("base", "", "对外地址前缀，用于打印长期链接，例如 https://clip.example.com")
 	secret := flag.String("secret", os.Getenv("AUTHCLIP_SECRET"), "静态加密口令；设置后 state 以 AES-256-GCM 落盘（建议用 AUTHCLIP_SECRET 环境变量）")
+	retain := flag.Int("retain-days", 0, "已归档任务的保留天数；0=永久保留（B 端历史也随之清理）")
 	flag.Parse()
 
 	st, err := openStore(*dir, strings.TrimSpace(*secret))
@@ -545,6 +634,24 @@ func main() {
 		}
 		a.geo = r
 		defer func() { _ = r.Close() }()
+	}
+
+	// 归档任务的保留期（0=永久）。到期会连 B 端历史一起清掉。
+	if *retain > 0 {
+		purge := func() {
+			if n := st.purgeArchived(time.Now().UTC().AddDate(0, 0, -*retain)); n > 0 {
+				log.Printf("已清理 %d 条归档任务（保留 %d 天）", n, *retain)
+			}
+		}
+		purge()
+		go func() {
+			for range time.Tick(6 * time.Hour) {
+				purge()
+			}
+		}()
+		log.Printf("归档保留期：%d 天", *retain)
+	} else {
+		log.Printf("归档保留期：永久（可用 -retain-days 设定）")
 	}
 
 	// 子命令：users / add
@@ -590,6 +697,7 @@ func (a *app) routes() (http.Handler, error) {
 	mux.HandleFunc("POST /api/users/{id}/rotate", a.wrap(a.rotateUser))
 	mux.HandleFunc("DELETE /api/users/{id}", a.wrap(a.deleteUser))
 	mux.HandleFunc("GET /api/audit", a.wrap(a.auditLog))
+	mux.HandleFunc("GET /api/export", a.wrap(a.exportSlots))
 
 	static, err := fs.Sub(webFS, "web")
 	if err != nil {
@@ -797,6 +905,12 @@ func (a *app) addMember(w http.ResponseWriter, r *http.Request, u *User) {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "仅管理员"})
 		return
 	}
+	// 建人 = 分发一条拥有该接收人全部权限的长期链接。
+	// 只有全量管理员能建，避免受限管理员自造身份。
+	if !u.canSeeAll() {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "创建接收人需要全量权限，请联系全量管理员"})
+		return
+	}
 	var body struct {
 		Label string `json:"label"`
 	}
@@ -990,6 +1104,66 @@ func (a *app) auditLog(w http.ResponseWriter, r *http.Request, u *User) {
 	writeJSON(w, http.StatusOK, a.st.audit(100))
 }
 
+// exportSlots：A 端批量导出（CSV / JSON），含已归档任务
+func (a *app) exportSlots(w http.ResponseWriter, r *http.Request, u *User) {
+	if !u.canSeeAll() {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "需要全量权限的管理员"})
+		return
+	}
+	label := map[string]string{}
+	for _, x := range a.st.users() {
+		label[x.ID] = x.Label
+	}
+	slots := a.st.exportSlots()
+	stamp := time.Now().Format("20060102-150405")
+
+	if r.URL.Query().Get("format") == "json" {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="authclip-%s.json"`, stamp))
+		_ = json.NewEncoder(w).Encode(slots)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="authclip-%s.csv"`, stamp))
+	cw := csv.NewWriter(w)
+	_ = cw.Write([]string{
+		"id", "label", "状态", "接收人", "下发人", "邮箱", "凭证", "注册地区",
+		"注册IP", "观测IP", "节点IP", "创建时间", "回传时间", "已归档",
+	})
+	for _, s := range slots {
+		state := "待回传"
+		if s.Code != "" || s.Email != "" {
+			state = "已回传"
+		}
+		if s.Deleted {
+			state = "已归档·" + state
+		}
+		_ = cw.Write([]string{
+			s.ID, s.Label, state, label[s.Member], label[s.Owner], s.Email, s.Code,
+			s.RegRegion, s.RegIP, s.SeenIP, s.NodeIP,
+			s.Created.Format("2006-01-02 15:04"), fmtTime(s.Submitted),
+			boolText(s.Deleted),
+		})
+	}
+	cw.Flush()
+	a.st.appendAudit(&Audit{Actor: u.ID, Label: u.Label, Action: "data.export", Target: fmt.Sprintf("%d rows", len(slots))})
+}
+
+func fmtTime(t time.Time) string {
+	if t.IsZero() || t.Year() < 2000 {
+		return ""
+	}
+	return t.Format("2006-01-02 15:04")
+}
+
+func boolText(b bool) string {
+	if b {
+		return "是"
+	}
+	return "否"
+}
+
 func (a *app) createSlot(w http.ResponseWriter, r *http.Request, u *User) {
 	if u.Role != "admin" {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "仅管理员"})
@@ -1161,12 +1335,29 @@ func (a *app) deleteSlot(w http.ResponseWriter, r *http.Request, u *User) {
 	if a.guardSlot(w, u, r.PathValue("id")) == nil {
 		return
 	}
-	if err := a.st.removeSlot(r.PathValue("id")); err != nil {
+	id := r.PathValue("id")
+
+	// 默认归档：B 仍能在历史里看到；?purge=1 才彻底删除（需全量权限）
+	if r.URL.Query().Get("purge") == "1" {
+		if !u.canSeeAll() {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "彻底删除需要全量权限"})
+			return
+		}
+		if err := a.st.hardDeleteSlot(id); err != nil {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "槽位不存在"})
+			return
+		}
+		a.st.appendAudit(&Audit{Actor: u.ID, Label: u.Label, Action: "slot.purge", Slot: id})
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true, "purged": true})
+		return
+	}
+
+	if _, err := a.st.archiveSlot(id); err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "槽位不存在"})
 		return
 	}
-	a.st.appendAudit(&Audit{Actor: u.ID, Label: u.Label, Action: "slot.delete", Slot: r.PathValue("id")})
-	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+	a.st.appendAudit(&Audit{Actor: u.ID, Label: u.Label, Action: "slot.archive", Slot: id})
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true, "archived": true})
 }
 
 func (a *app) mine(w http.ResponseWriter, r *http.Request, u *User) {
@@ -1188,7 +1379,7 @@ func (a *app) report(w http.ResponseWriter, r *http.Request, u *User) {
 		return
 	}
 	sl := a.st.slotByID(r.PathValue("id"))
-	if sl == nil || sl.Member != u.ID {
+	if sl == nil || sl.Member != u.ID || sl.Deleted {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "任务不存在"})
 		return
 	}
@@ -1282,10 +1473,10 @@ func (a *app) report(w http.ResponseWriter, r *http.Request, u *User) {
 
 	var denied bool
 	updated, err := a.st.updateSlot(sl.ID, func(s *Slot) error {
-		// 事务内再校验一次接收人：读与写之间可能刚被改派
-		if s.Member != u.ID {
+		// 事务内再校验一次接收人：读与写之间可能刚被改派或归档
+		if s.Member != u.ID || s.Deleted {
 			denied = true
-			return errors.New("reassigned")
+			return errors.New("reassigned or archived")
 		}
 		// 链接在提交期间被换掉，也要按新链接的 state 再核一次
 		if want := linkStateOf(s.Link); want != "" && stateParam != want {
@@ -1506,3 +1697,5 @@ func plausibleURL(s string) bool {
 	}
 	return host != "" && !strings.ContainsAny(host, " \t\r\n")
 }
+
+

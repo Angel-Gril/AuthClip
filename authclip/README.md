@@ -282,3 +282,48 @@ PASS TestRotateInvalidatesOldToken 轮换后旧 token 失效、新 token 可用
 PASS TestSelfProtection            不能吊销/删除自己
 PASS TestAuditTrail                审计里能查到 slot.create / slot.reassign
 ```
+
+## 十三、归档、历史、导出与留存期（v1.3.0）
+
+### 归档而不是硬删除
+
+`DELETE /api/slots/{id}` 现在是**归档**：任务从 A 的看板消失，但 B 的页面多出「历史（只读）」，能看到自己当初提交的邮箱/code/地区/IP。
+
+- 归档后**不能再回传**（服务端 404，不只是前端隐藏按钮）
+- `DELETE /api/slots/{id}?purge=1` 才是彻底删除（需 `all` 权限），B 的历史也一并清除
+
+### 导出（A 端批量）
+
+| 方式 | 说明 |
+| :--- | :--- |
+| 页面按钮 | 顶栏「导出 CSV / 导出 JSON」（仅 `all` 管理员可见） |
+| `GET /api/export?format=csv` | 字段：id、备注、状态、接收人、下发人、邮箱、凭证、注册地区、注册IP、观测IP、节点IP、创建时间、回传时间、已归档 |
+| JSON | 同数据，含 `deleted / submitted / state_param` 等完整字段 |
+
+导出**包含已归档任务**，导出动作本身也会写一条审计 `data.export`。
+
+### 留存期
+
+```sh
+authclip -http=0.0.0.0:8090 -dir=./data -retain-days 30
+```
+
+- `0`（默认）= 归档任务永久保留，B 的历史也永久可查
+- `N>0` = 归档超过 N 天的任务在启动时与每 6 小时清理一次，**B 的历史同步消失**
+
+> 关于「7 天」：7 天会把你刚导出完的数据从服务端抹掉，而且不可恢复（加密状态下也无从重建）。
+> 建议先用默认 0（永久），确认导出流程跑通后再设 30 天；真要 7 天，务必保证每日导出。
+
+### 权限收紧
+
+`POST /api/members` 现在**只有 `all` 管理员能调**。原因：建人等于分发一条拥有该接收人全部权限的长期链接，
+受限管理员若能自建身份，就能绕过「只能管自己任务」的边界。`own` 管理员需要新接收人时，找全量管理员建。
+
+### 测试
+
+```
+PASS TestArchiveKeepsMemberHistory   归档后看板不显示、B 历史仍在、且不能再回传
+PASS TestPurgeOnlyForAllScope        彻底删除需 all；own 访问他人任务仍 404
+PASS TestOwnScopeCannotCreateMember  own 建接收人 403，all 正常
+PASS TestExportCSV                   导出含已归档行与表头；own 导出 403
+```
