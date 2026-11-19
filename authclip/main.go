@@ -55,7 +55,7 @@ const (
 	maxBody    = 128 << 10
 	maxLink    = 8192
 	sessionEC  = 20 * time.Second
-	appVersion = "v1.4.0" // v1.3.x 安全修复｜v1.4.0: 唯一用户名 + 按用户名下发
+	appVersion = "v1.4.1" // v1.4.0: 唯一用户名｜v1.4.1: 管理员链接不可取 / 审计失败拒答 / 换链清旧回传
 )
 
 // ---------------------------------------------------------------- 模型
@@ -448,7 +448,8 @@ func (s *store) removeUser(id string) error {
 	return os.ErrNotExist
 }
 
-func (s *store) appendAudit(a *Audit) {
+// appendAudit 返回落盘错误：涉及敏感数据的操作必须据此 fail-closed
+func (s *store) appendAudit(a *Audit) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	a.At = time.Now().UTC()
@@ -456,7 +457,17 @@ func (s *store) appendAudit(a *Audit) {
 	if len(s.d.Audit) > 500 { // 只留最近 500 条
 		s.d.Audit = s.d.Audit[len(s.d.Audit)-500:]
 	}
-	_ = s.saveLocked()
+	if err := s.saveLocked(); err != nil {
+		// 落盘失败就回滚这条审计，避免内存与磁盘不一致
+		s.d.Audit = s.d.Audit[:len(s.d.Audit)-1]
+		return err
+	}
+	return nil
+}
+
+// auditBestEffort：失败不影响主流程（用于非敏感动作）
+func (s *store) auditBestEffort(a *Audit) {
+	_ = s.appendAudit(a)
 }
 
 func (s *store) audit(limit int) []Audit {
@@ -1085,10 +1096,25 @@ func (a *app) userLink(w http.ResponseWriter, r *http.Request, u *User) {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "该账号已吊销，恢复后再取链接"})
 		return
 	}
-	a.st.appendAudit(&Audit{
+	// 只允许取「接收人」的链接。管理员的链接一旦外流就是身份接管，
+	// 任何管理者都不得通过 API 取得他人的 #a=；需要恢复用自己的长期链接，
+	// 或用服务器本地的 CLI（authclip link admin 标签）。
+	if target.Role != "member" {
+		writeJSON(w, http.StatusForbidden, map[string]string{
+			"error": "不能通过接口取管理员链接；管理员链接只在创建时下发，遗失请用服务器上的 CLI 重新签发",
+		})
+		return
+	}
+	// 审计失败就不给链接（fail-closed）
+	if err := a.st.appendAudit(&Audit{
 		Actor: u.ID, Label: u.Label, Action: "user.link",
 		Target: target.ID + ":" + target.Label,
-	})
+	}); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{
+			"error": "审计写入失败，已拒绝返回链接",
+		})
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]string{
 		"id": target.ID, "username": target.Username, "label": target.Label, "role": target.Role,
 		"link": a.linkFor(target),
@@ -1229,6 +1255,16 @@ func (a *app) rotateUser(w http.ResponseWriter, r *http.Request, u *User) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "不能轮换自己"})
 		return
 	}
+	// 与 userLink 同一条红线：不能替别的管理员签发新链接（等于接管其身份）
+	if target := a.st.userByID(id); target == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "账号不存在"})
+		return
+	} else if target.Role != "member" {
+		writeJSON(w, http.StatusForbidden, map[string]string{
+			"error": "不能轮换管理员链接；管理员链接遗失请在服务器上用 CLI 重新签发",
+		})
+		return
+	}
 	var fresh *User
 	upd, err := a.st.updateUser(id, func(x *User) error {
 		x.Token = newToken()
@@ -1239,7 +1275,10 @@ func (a *app) rotateUser(w http.ResponseWriter, r *http.Request, u *User) {
 		return
 	}
 	fresh = upd
-	a.st.appendAudit(&Audit{Actor: u.ID, Label: u.Label, Action: "user.rotate", Target: id + ":" + upd.Label})
+	if err := a.st.appendAudit(&Audit{Actor: u.ID, Label: u.Label, Action: "user.rotate", Target: id + ":" + upd.Label}); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "已轮换但审计写入失败，请检查磁盘"})
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"id": fresh.ID, "username": fresh.Username, "label": fresh.Label,
 		"link": a.linkFor(fresh), "token": fresh.Token,
@@ -1300,11 +1339,16 @@ func (a *app) exportSlots(w http.ResponseWriter, r *http.Request, u *User) {
 		mode = "full"
 	}
 
-	// 审计先写，再吐数据：不允许出现「导出成功但没留痕」
-	a.st.appendAudit(&Audit{
+	// 审计先写，再吐数据：写不进去就拒绝导出（fail-closed）
+	if err := a.st.appendAudit(&Audit{
 		Actor: u.ID, Label: u.Label, Action: "data.export",
 		Target: fmt.Sprintf("%d rows mode=%s", len(slots), mode),
-	})
+	}); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{
+			"error": "审计写入失败，已拒绝导出（避免无记录的敏感数据外流）",
+		})
+		return
+	}
 
 	pick := func(v string, mask func(string) string) string {
 		if full {
@@ -1526,7 +1570,13 @@ func (a *app) patchSlot(w http.ResponseWriter, r *http.Request, u *User) {
 	}
 	sl, err := a.st.updateSlot(r.PathValue("id"), func(s *Slot) error {
 		if body.Link != nil {
-			s.Link = strings.TrimSpace(*body.Link)
+			next := strings.TrimSpace(*body.Link)
+			// 换链接 = 新一轮授权：旧回传必须清掉，否则管理员会把
+			// 上一轮的 code 当成本轮结果（state 不同即视为新一轮）。
+			if next != s.Link && linkStateOf(next) != linkStateOf(s.Link) {
+				clearReturned(s)
+			}
+			s.Link = next
 		}
 		if body.Label != nil {
 			v := strings.TrimSpace(*body.Label)
@@ -1560,8 +1610,11 @@ func (a *app) patchSlot(w http.ResponseWriter, r *http.Request, u *User) {
 		return
 	}
 	action := "slot.update"
-	if body.Member != nil {
+	switch {
+	case body.Member != nil:
 		action = "slot.reassign"
+	case body.Link != nil:
+		action = "slot.relink"
 	}
 	a.st.appendAudit(&Audit{Actor: u.ID, Label: u.Label, Action: action, Slot: sl.ID})
 	writeJSON(w, http.StatusOK, sl)
@@ -1971,6 +2024,9 @@ func plausibleURL(s string) bool {
 	}
 	return host != "" && !strings.ContainsAny(host, " \t\r\n")
 }
+
+
+
 
 
 

@@ -439,3 +439,31 @@ authclip -dir ./data users                        # 显示 角色/范围/用户�
 PASS TestUsernameUniquenessAndLookup   重名 409、按用户名下发、未知用户名 400、改名后旧名失效
 PASS TestUsernameBackfilledForLegacyData 老数据自动补齐（Legacy User → legacy-user）
 ```
+
+## 十七、v1.4.1 安全修复（针对 6096cde 审查）
+
+### 1. 仍可取出其他管理员的登录链接
+
+- **问题**：`GET /api/users/{id}/link` 与 `POST /api/users/{id}/rotate` 只校验调用者是 `all`，不校验目标角色。拿到另一个管理员的 `#a=` 就等于接管其身份。
+- **修复**：两个接口都**只对 `member` 角色开放**；管理员目标返回 `403`。管理员链接只在创建时下发一次，遗失请在服务器上用 `authclip link admin 标签`（需要主机权限，属可信边界）。
+- 实测：取其他管理员 `403`、取自己 `403`、取接收人 `200`。
+
+### 2. 审计写入失败时仍返回敏感数据
+
+- **问题**：`appendAudit` 内部 `_ = s.saveLocked()`，忽略落盘错误；导出与取链接都是"先审计后返回"，但审计其实可能悄悄失败。
+- **修复**：`appendAudit` 改为**返回错误并回滚内存里的那条审计**；`data.export`、`user.link`、`user.rotate` 改为 **fail-closed**——审计写不进去就 `500`，不吐数据。
+- 实测：把存储路径改成目录制造写失败，导出 `500` 且响应体不含凭证；取链接同样 `500`。
+
+### 3. 换授权链接后旧回传仍在
+
+- **问题**：`patchSlot` 换 `link` 时只改字段，不清 `code/callback/email/ip`。管理员容易把上一轮的 code 当成本轮结果。
+- **修复**：换链接且 **state 发生变化**即视为新一轮，调用 `clearReturned()`；同一条链接重复写入（state 未变）不清空。审计动作为 `slot.relink`。
+- 实测：`ROUND1 → ROUND2` 后 `code/email/callback/state` 全空，审计多一条 `slot.relink`。
+
+### 测试（共 25 个）
+
+```
+PASS TestCannotFetchOrRotateAdminLink      管理员链接 403（他人/自己），接收人 200
+PASS TestAuditFailureBlocksSensitiveOutput 写盘失败时导出/取链接 500 且不含数据
+PASS TestRelinkClearsPreviousResult        换 state 清回传并记 slot.relink；同 state 不清
+```

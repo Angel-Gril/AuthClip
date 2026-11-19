@@ -750,3 +750,112 @@ func TestUsernameBackfilledForLegacyData(t *testing.T) {
 	}
 }
 
+
+// ---------------------------------------------------------------- v1.4.1
+
+func TestCannotFetchOrRotateAdminLink(t *testing.T) {
+	e := newEnv(t, "")
+	// 再造一个全量管理员，作为「别人」
+	other, err := e.app.st.addUser("admin", "all", "A3", "a3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 取另一个管理员的链接：403
+	if code, _ := e.call(t, "GET", "/api/users/"+other.ID+"/link", e.admin.Token, nil); code != http.StatusForbidden {
+		t.Fatalf("取管理员链接应 403，实际 %d", code)
+	}
+	// 取自己的链接也不行（同样走 403 分支，避免"顺手看一眼"）
+	if code, _ := e.call(t, "GET", "/api/users/"+e.admin.ID+"/link", e.admin.Token, nil); code != http.StatusForbidden {
+		t.Fatalf("取自己链接应 403，实际 %d", code)
+	}
+	// 轮换另一个管理员：403，且其 token 不变
+	if code, _ := e.call(t, "POST", "/api/users/"+other.ID+"/rotate", e.admin.Token, map[string]any{}); code != http.StatusForbidden {
+		t.Fatalf("轮换管理员应 403，实际 %d", code)
+	}
+	if again := e.app.st.userByID(other.ID); again == nil || again.Token != other.Token {
+		t.Fatal("管理员 token 被改动了")
+	}
+	// 接收人的链接仍然可娶
+	if code, _ := e.call(t, "GET", "/api/users/"+e.b1.ID+"/link", e.admin.Token, nil); code != http.StatusOK {
+		t.Fatalf("取接收人链接应 200，实际 %d", code)
+	}
+}
+
+func TestAuditFailureBlocksSensitiveOutput(t *testing.T) {
+	e := newEnv(t, "")
+	id := e.newSlot(t, e.b1)
+	e.call(t, "POST", "/api/slots/"+id+"/report", e.b1.Token, map[string]any{
+		"email": "b1@example.com", "callback": "http://localhost:54545/callback?code=SECRET&state=STATE-ONE",
+	})
+
+	// 把存储路径改成目录，使 saveLocked 必定失败
+	e.app.st.mu.Lock()
+	orig := e.app.st.path
+	bad := filepath.Join(filepath.Dir(orig), "as-dir")
+	_ = os.MkdirAll(bad, 0o700)
+	e.app.st.path = bad
+	e.app.st.mu.Unlock()
+	t.Cleanup(func() {
+		e.app.st.mu.Lock()
+		e.app.st.path = orig
+		e.app.st.mu.Unlock()
+		_ = os.RemoveAll(bad)
+	})
+
+	// 导出：必须 500 且不带数据
+	req, _ := http.NewRequest("GET", e.srv.URL+"/api/export?format=csv&secrets=1&confirm=EXPORT", nil)
+	req.Header.Set("X-Token", e.admin.Token)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := io.ReadAll(res.Body)
+	res.Body.Close()
+	if res.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("审计失败时导出应 500，实际 %d", res.StatusCode)
+	}
+	if strings.Contains(string(raw), "SECRET") {
+		t.Fatal("审计失败仍返回了敏感数据")
+	}
+	// 取链接：同样 500
+	if code, body := e.call(t, "GET", "/api/users/"+e.b1.ID+"/link", e.admin.Token, nil); code != http.StatusInternalServerError {
+		t.Fatalf("审计失败时取链接应 500，实际 %d %v", code, body)
+	}
+}
+
+func TestRelinkClearsPreviousResult(t *testing.T) {
+	e := newEnv(t, "")
+	id := e.newSlot(t, e.b1)
+	e.call(t, "POST", "/api/slots/"+id+"/report", e.b1.Token, map[string]any{
+		"email": "old@example.com", "callback": "http://localhost:54545/callback?code=OLD&state=STATE-ONE",
+	})
+	newLink := strings.Replace(testLink, "STATE-ONE", "STATE-TWO", 1)
+	if code, out := e.call(t, "PATCH", "/api/slots/"+id, e.admin.Token, map[string]any{"link": newLink}); code != http.StatusOK {
+		t.Fatalf("换链接失败：%d %v", code, out)
+	}
+	sl := e.app.st.slotByID(id)
+	if sl.Code != "" || sl.Email != "" || sl.Callback != "" || sl.StateParam != "" || !sl.Submitted.IsZero() {
+		t.Fatalf("换链接后旧回传仍在：%+v", sl)
+	}
+	// 审计动作是 relink
+	rows := e.app.st.audit(20)
+	found := false
+	for _, r := range rows {
+		if r.Action == "slot.relink" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("换链接未记 slot.relink 审计")
+	}
+	// 同一条链接重复提交（state 不变）不应清空
+	e.call(t, "POST", "/api/slots/"+id+"/report", e.b1.Token, map[string]any{
+		"email": "b2@example.com", "callback": "http://localhost:54545/callback?code=NEW&state=STATE-TWO",
+	})
+	if code, _ := e.call(t, "PATCH", "/api/slots/"+id, e.admin.Token, map[string]any{"link": newLink}); code != http.StatusOK {
+		t.Fatal("重复写同一链接失败")
+	}
+	if sl2 := e.app.st.slotByID(id); sl2.Code != "NEW" {
+		t.Fatalf("同一 state 的重复写不应清空回传，实际 code=%q", sl2.Code)
+	}
+}
