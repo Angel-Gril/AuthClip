@@ -455,11 +455,18 @@ function auditPanel() {
 }
 
 
+function slotStale(slot) {
+  const ls = stateOfLink(slot.link);
+  return Boolean(slot.state_param) && (!ls || slot.state_param !== ls);
+}
+
 function adminSlotCard(slot) {
   const member = (state.board.members || []).find((m) => m.id === slot.member);
   const filled = Boolean(slot.code || slot.email);
   const stateOfLinkValue = stateOfLink(slot.link);
-  const stateMismatch = slot.state_param && stateOfLinkValue && slot.state_param !== stateOfLinkValue;
+  // 回传的 state 与当前链接对不上，或链接本身没有 state 无法核对 → 视为"可能不是本轮"
+  const stale = slotStale(slot);
+  const stateMismatch = stale;
 
   const edit = el("div", { class: "stack", hidden: true },
     (() => {
@@ -585,12 +592,43 @@ function adminSlotCard(slot) {
       ),
       el("section", { class: "stack" },
         el("h3", { text: "B 回传" }),
+        // 日常核对就放在这里：不靠导出，一眼看到"这条可能不是本轮"
+        stale ? el("div", { class: "feedback err" },
+          el("b", { text: "⚠ 这条回传与当前链接对不上。" }),
+          el("span", { text: " " + (stateOfLinkValue
+            ? "回调的 state 与当前授权链接不同，可能是换链接前的旧结果。"
+            : "当前链接没有 state，无法核对来源，建议重新下发链接。") }),
+          el("div", { class: "row" },
+            el("button", {
+              type: "button", class: "danger", text: "清空这条回传",
+              onclick: async () => {
+                try {
+                  await api(`/api/slots/${slot.id}/clear`, { method: "POST", body: {} });
+                  flash("已清空；请让接收人重新提交本轮结果");
+                  await refresh();
+                } catch (e) { flash(e.message, "err"); }
+              },
+            }),
+          ),
+        ) : null,
         facts,
         slot.callback ? el("div", {}, el("h3", { text: "原始回调链接" }), el("div", { class: "cred", text: slot.callback })) : null,
         slot.code ? el("div", { class: "cred", text: slot.code }) : null,
         el("div", { class: "row" },
-          el("button", { type: "button", class: "primary", text: "复制凭证", disabled: !slot.code, onclick: () => copy(slot.code, "凭证已复制") }),
-          el("button", { type: "button", text: "复制整行", disabled: !copyAll, onclick: () => copy(copyAll, "已复制：code / 邮箱 / 地区 / IP / 节点") }),
+          el("button", {
+            type: "button", class: "primary", text: "复制凭证", disabled: !slot.code,
+            onclick: () => {
+              if (stale && !window.confirm("这条回传与当前链接不一致（可能来自上一轮）。\n仍要复制吗？")) return;
+              void copy(slot.code, "凭证已复制");
+            },
+          }),
+          el("button", {
+            type: "button", text: "复制整行", disabled: !copyAll,
+            onclick: () => {
+              if (stale && !window.confirm("这条回传与当前链接不一致（可能来自上一轮）。\n仍要复制吗？")) return;
+              void copy(copyAll, "已复制：code / 邮箱 / 地区 / IP / 节点");
+            },
+          }),
         ),
       ),
     ),
@@ -650,6 +688,14 @@ function adminView() {
       }),
       el("span", { class: "hint", text: "默认脱敏（凭证/邮箱/IP 打码）；完整导出会二次确认并留审计。" }),
     ) : null,
+    (() => {
+      const n = slots.filter(slotStale).length;
+      if (!n) return null;
+      return el("div", { class: "feedback err" },
+        el("b", { text: `⚠ 有 ${n} 条任务的回传与当前链接对不上` }),
+        el("span", { text: "（多为换链接前的旧结果）。点开对应卡片可一键清空，或让接收人重新提交。" }),
+      );
+    })(),
     feedbackLine(),
     newSlotForm(),
     memberPanel(),
@@ -1043,6 +1089,8 @@ window.addEventListener("focus", () => {
 });
 
 void start();
+
+
 
 
 

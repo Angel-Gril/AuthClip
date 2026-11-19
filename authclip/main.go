@@ -55,7 +55,7 @@ const (
 	maxBody    = 128 << 10
 	maxLink    = 8192
 	sessionEC  = 20 * time.Second
-	appVersion = "v1.4.3" // v1.4.2: 全局管理员可取链接｜v1.4.3: 换链一律清回传（可显式保留+留痕）
+	appVersion = "v1.4.4" // v1.4.3: 换链清回传｜v1.4.4: 错配回传在卡片与复制处拦截
 )
 
 // ---------------------------------------------------------------- 模型
@@ -2025,6 +2025,7 @@ func plausibleURL(s string) bool {
 	}
 	return host != "" && !strings.ContainsAny(host, " \t\r\n")
 }
+
 
 
 
