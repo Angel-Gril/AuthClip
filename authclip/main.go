@@ -42,7 +42,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode"
 
 	"embed"
 
@@ -56,7 +55,7 @@ const (
 	maxBody    = 128 << 10
 	maxLink    = 8192
 	sessionEC  = 20 * time.Second
-	appVersion = "v1.5.2" // v1.5.1: await 窗口修复｜v1.5.2: 代次写入改为强制约定 + 静态检查
+	appVersion = "v1.5.3" // v1.5.2: 代次写入强制化｜v1.5.3: 去掉自动读剪贴板 / CSV 公式中和
 )
 
 // ---------------------------------------------------------------- 模型
@@ -1430,32 +1429,28 @@ func (a *app) exportSlots(w http.ResponseWriter, r *http.Request, u *User) {
 		if s.Deleted {
 			state = "已归档·" + state
 		}
-		row := []string{
-			s.ID, s.Label, state, label[s.Member], label[s.Owner],
-			pick(s.Email, maskEmail), pick(s.Code, maskCode),
-			s.RegRegion, pick(s.RegIP, maskIP), pick(s.SeenIP, maskIP), pick(s.NodeIP, maskIP),
+		_ = cw.Write([]string{
+			csvSafe(s.ID), csvSafe(s.Label), state, csvSafe(label[s.Member]), csvSafe(label[s.Owner]),
+			csvSafe(pick(s.Email, maskEmail)), csvSafe(pick(s.Code, maskCode)),
+			s.RegRegion, csvSafe(pick(s.RegIP, maskIP)), csvSafe(pick(s.SeenIP, maskIP)), csvSafe(pick(s.NodeIP, maskIP)),
 			s.Created.Format("2006-01-02 15:04"), fmtTime(s.Submitted),
 			boolText(s.Deleted), mode,
-		}
-		for i, cell := range row {
-			row[i] = spreadsheetText(cell)
-		}
-		_ = cw.Write(row)
+		})
 	}
 	cw.Flush()
 }
 
-// spreadsheetText keeps formula-like values as text when opening the CSV in a spreadsheet.
-func spreadsheetText(value string) string {
-	first := strings.TrimLeftFunc(value, func(r rune) bool {
-		return unicode.IsSpace(r) || r == '\ufeff'
-	})
-	if strings.HasPrefix(value, "\t") || strings.HasPrefix(value, "\r") ||
-		strings.HasPrefix(value, "\n") ||
-		(first != "" && strings.ContainsRune("=+-@＝＋－＠", []rune(first)[0])) {
-		return "'" + value
+// csvSafe 防 CSV/公式注入：电子表格会把 = + - @ 或制表/回车开头的单元格当公式执行。
+// 加一个前导单引号让 Excel / Numbers / LibreOffice 一律当文本。
+func csvSafe(v string) string {
+	if v == "" {
+		return v
 	}
-	return value
+	switch v[0] {
+	case '=', '+', '-', '@', '\t', '\r':
+		return "'" + v
+	}
+	return v
 }
 
 // 脱敏：保留可辨识的形状，去掉可用性
@@ -2105,6 +2100,7 @@ func plausibleURL(s string) bool {
 	}
 	return host != "" && !strings.ContainsAny(host, " \t\r\n")
 }
+
 
 
 

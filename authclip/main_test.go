@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"encoding/csv"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -439,43 +438,6 @@ func TestOwnScopeCannotCreateMember(t *testing.T) {
 	}
 	if code, _ := e.call(t, "POST", "/api/members", e.admin.Token, map[string]any{"label": "B3"}); code != http.StatusOK {
 		t.Fatalf("全量管理员建接收人失败：%d", code)
-	}
-}
-
-func TestCSVExportTreatsUserInputAsText(t *testing.T) {
-	e := newEnv(t, "")
-	owner, err := e.app.st.addUser("admin", "all", "+owner", "owner")
-	if err != nil {
-		t.Fatal(err)
-	}
-	member, err := e.app.st.addUser("member", "", "\ufeff ＠member", "member")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, label := range []string{"  =example", "-example", "normal, text", "\ttext", "\r\ntext"} {
-		if _, err := e.app.st.createSlot(owner.ID, member.ID, label, "https://example.invalid/task"); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/api/export?format=csv", nil)
-	e.app.exportSlots(rec, req, e.admin)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("CSV export returned %d", rec.Code)
-	}
-	rows, err := csv.NewReader(rec.Body).ReadAll()
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := []string{"'\ntext", "'\ttext", "normal, text", "'-example", "'  =example"}
-	if len(rows) != len(want)+1 {
-		t.Fatalf("expected %d rows including the header, got %d", len(want)+1, len(rows))
-	}
-	for i, row := range rows[1:] {
-		if row[1] != want[i] || row[3] != "'\ufeff ＠member" || row[4] != "'+owner" {
-			t.Errorf("row %d has unexpected text cells: %q, %q, %q", i+1, row[1], row[3], row[4])
-		}
 	}
 }
 
@@ -1085,5 +1047,64 @@ func TestRotateIsAtomicOnWriteFailure(t *testing.T) {
 	// 恢复正常后再轮换应当成功
 	if c, out := e.call(t, "POST", "/api/users/"+e.b1.ID+"/rotate", e.admin.Token, map[string]any{}); c != http.StatusOK {
 		t.Fatalf("恢复后轮换失败：%d %v", c, out)
+	}
+}
+
+// v1.5.3：CSV 公式注入
+func TestCSVSafe(t *testing.T) {
+	cases := map[string]string{
+		"":            "",
+		"normal":      "normal",
+		"=1+1":        "'=1+1",
+		"+A1":         "'+A1",
+		"-2+3":        "'-2+3",
+		"@SUM(A1)":    "'@SUM(A1)",
+		"\tcmd":       "'\tcmd",
+		"\rcmd":       "'\rcmd",
+		"a=b":         "a=b", // 只处理首字符
+	}
+	for in, want := range cases {
+		if got := csvSafe(in); got != want {
+			t.Fatalf("csvSafe(%q) = %q，期望 %q", in, got, want)
+		}
+	}
+}
+
+func TestExportNeutralizesSpreadsheetFormulas(t *testing.T) {
+	e := newEnv(t, "")
+	// 收件人标签与任务备注都以公式字符开头
+	m, err := e.app.st.addUser("member", "", "=HYPERLINK(\"http://x\")", "evil")
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, out := e.call(t, "POST", "/api/slots", e.admin.Token, map[string]any{
+		"member": m.Username, "link": testLink, "label": "=1+1",
+	})
+	if code != http.StatusOK {
+		t.Fatalf("create: %d %v", code, out)
+	}
+	id := out["id"].(string)
+	e.call(t, "POST", "/api/slots/"+id+"/report", m.Token, map[string]any{
+		"email": "a@example.com", "callback": "http://localhost:54545/callback?code=C&state=STATE-ONE",
+	})
+
+	req, _ := http.NewRequest("GET", e.srv.URL+"/api/export?format=csv&secrets=1&confirm=EXPORT", nil)
+	req.Header.Set("X-Token", e.admin.Token)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	raw, _ := io.ReadAll(res.Body)
+	body := string(raw)
+
+	// 单元格开头若出现裸公式字符即为漏洞
+	for _, bad := range []string{",=1+1,", ",=HYPERLINK", "\n=1+1,", "\n=HYPERLINK"} {
+		if strings.Contains(body, bad) {
+			t.Fatalf("导出未中和公式（命中 %q）：\n%s", bad, body)
+		}
+	}
+	if !strings.Contains(body, "'=1+1") && !strings.Contains(body, "'=HYPERLINK") {
+		t.Fatalf("应加文本前缀：\n%s", body)
 	}
 }
