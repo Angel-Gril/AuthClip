@@ -610,3 +610,68 @@ func TestExportIsMaskedByDefaultAndAuditedFirst(t *testing.T) {
 }
 
 
+
+func TestLinkRevealIsPerRequestAndAudited(t *testing.T) {
+	e := newEnv(t, "")
+	// 列表仍然不含 token
+	req, _ := http.NewRequest("GET", e.srv.URL+"/api/users", nil)
+	req.Header.Set("X-Token", e.admin.Token)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := io.ReadAll(res.Body)
+	res.Body.Close()
+	if strings.Contains(string(raw), e.b1.Token) {
+		t.Fatal("账号列表仍带 token")
+	}
+
+	// 按单条取链接：200 且是 #b= 形式
+	req, _ = http.NewRequest("GET", e.srv.URL+"/api/users/"+e.b1.ID+"/link", nil)
+	req.Header.Set("X-Token", e.admin.Token)
+	res, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("取链接: %d", res.StatusCode)
+	}
+	var got map[string]string
+	_ = json.NewDecoder(res.Body).Decode(&got)
+	if !strings.Contains(got["link"], "#b="+e.b1.Token) {
+		t.Fatalf("链接不对：%v", got)
+	}
+
+	// 限自己范围的管理员：403
+	own, _ := e.app.st.addUser("admin", "own", "A2")
+	if code, _ := e.call(t, "GET", "/api/users/"+e.b1.ID+"/link", own.Token, nil); code != http.StatusForbidden {
+		t.Fatalf("own 能取链接：%d", code)
+	}
+
+	// 已吊销的账号：409
+	e.call(t, "PATCH", "/api/users/"+e.b1.ID, e.admin.Token, map[string]any{"revoke": true})
+	if code, _ := e.call(t, "GET", "/api/users/"+e.b1.ID+"/link", e.admin.Token, nil); code != http.StatusConflict {
+		t.Fatalf("吊销后应 409，实际 %d", code)
+	}
+
+	// 审计里有 user.link
+	req, _ = http.NewRequest("GET", e.srv.URL+"/api/audit", nil)
+	req.Header.Set("X-Token", e.admin.Token)
+	res2, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res2.Body.Close()
+	var rows []map[string]any
+	_ = json.NewDecoder(res2.Body).Decode(&rows)
+	found := false
+	for _, r := range rows {
+		if r["action"] == "user.link" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("查看链接未留审计")
+	}
+}

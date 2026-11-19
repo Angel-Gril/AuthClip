@@ -55,7 +55,7 @@ const (
 	maxBody    = 128 << 10
 	maxLink    = 8192
 	sessionEC  = 20 * time.Second
-	appVersion = "v1.3.1" // v1.3: 归档历史/导出/留存期｜v1.3.1: 令牌不外泄 / state 强制 / 导出脱敏+先审计
+	appVersion = "v1.3.2" // v1.3.1: 令牌不外泄/state 强制/导出脱敏｜v1.3.2: 单条取链接+审计
 )
 
 // ---------------------------------------------------------------- 模型
@@ -694,6 +694,7 @@ func (a *app) routes() (http.Handler, error) {
 	mux.HandleFunc("GET /api/users", a.wrap(a.listUsers))
 	mux.HandleFunc("POST /api/users", a.wrap(a.createUser))
 	mux.HandleFunc("PATCH /api/users/{id}", a.wrap(a.patchUser))
+	mux.HandleFunc("GET /api/users/{id}/link", a.wrap(a.userLink))
 	mux.HandleFunc("POST /api/users/{id}/rotate", a.wrap(a.rotateUser))
 	mux.HandleFunc("DELETE /api/users/{id}", a.wrap(a.deleteUser))
 	mux.HandleFunc("GET /api/audit", a.wrap(a.auditLog))
@@ -949,6 +950,33 @@ func (a *app) listUsers(w http.ResponseWriter, r *http.Request, u *User) {
 		})
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// userLink：按单条取一次长期链接（全量管理员）。
+// 列表接口永远不带令牌，避免"一次请求拉走全部身份"；
+// 这里按需取单条，并且每次都留审计。
+func (a *app) userLink(w http.ResponseWriter, r *http.Request, u *User) {
+	if !u.canSeeAll() {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "需要全量权限的管理员"})
+		return
+	}
+	target := a.st.userByID(r.PathValue("id"))
+	if target == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "账号不存在"})
+		return
+	}
+	if target.Revoked {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "该账号已吊销，恢复后再取链接"})
+		return
+	}
+	a.st.appendAudit(&Audit{
+		Actor: u.ID, Label: u.Label, Action: "user.link",
+		Target: target.ID + ":" + target.Label,
+	})
+	writeJSON(w, http.StatusOK, map[string]string{
+		"id": target.ID, "label": target.Label, "role": target.Role,
+		"link": a.linkFor(target),
+	})
 }
 
 func (a *app) createUser(w http.ResponseWriter, r *http.Request, u *User) {
@@ -1808,6 +1836,7 @@ func plausibleURL(s string) bool {
 	}
 	return host != "" && !strings.ContainsAny(host, " \t\r\n")
 }
+
 
 
 

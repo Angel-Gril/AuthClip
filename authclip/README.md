@@ -375,3 +375,27 @@ PASS TestLinkMustCarryState                    建/改链接缺 state 一律 400
 PASS TestReportRequiresFullCallbackURL         裸 code 400、缺 state 400、完整回调通过
 PASS TestExportIsMaskedByDefaultAndAuditedFirst 默认脱敏、完整导出需确认、审计区分模式
 ```
+
+## 十五、v1.3.2：单条取链接（对 v1.3.1 的折中）
+
+v1.3.1 为了堵"账号列表暴露令牌"，把查看链接的能力一并砍了——A 端只能「重新生成」，而重新生成会让 B 手上那条立即失效。副作用比风险本身更烦。
+
+v1.3.2 折中：
+
+| 接口 | 行为 |
+| :--- | :--- |
+| `GET /api/users`、`/api/board` | **仍然不含任何 token/link**（没有批量出口） |
+| `GET /api/users/{id}/link` | 按单条、按需取一次链接；**每次写 `user.link` 审计**；已吊销账号返回 409 |
+| `POST /api/users/{id}/rotate` | 需要作废旧链接时才用 |
+
+界面：接收人一行「查看链接」（取到即复制，并提示"此次查看已记审计"）+「重新生成链接」。
+
+实测：
+
+```
+列表字段:        created,id,label,revoked          ← 无 token
+单条取链接:      http://…/#b=z4kxhiija…             ← 200
+审计最新:        {"action":"user.link","target":"hd2mzjqcxj:B1-家宽"}
+```
+
+新增测试 `TestLinkRevealIsPerRequestAndAudited`（共 20 个）：列表无 token、单条可取、own 范围 403、吊销 409、审计留痕。

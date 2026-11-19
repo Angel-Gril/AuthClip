@@ -279,6 +279,15 @@ function memberPanel() {
       mono("链接不在列表中显示"),
       el("span", { class: "grow" }),
       el("button", {
+        type: "button", text: "查看链接", disabled: m.revoked,
+        onclick: async () => {
+          try {
+            const r = await api(`/api/users/${m.id}/link`);
+            await copy(r.link, "已复制（此次查看已记审计）");
+          } catch (e) { flash(e.message, "err"); }
+        },
+      }),
+      el("button", {
         type: "button", text: "重新生成链接", disabled: m.revoked,
         onclick: async () => {
           try {
