@@ -177,9 +177,16 @@ function roundFor(slot) {
 // expectGen：写入方在「读」之前看到的代次。异步路径必须传：
 // 否则 await 期间换链、round 被删又重建之后，旧数据会写进新轮次。
 function patchRound(id, patch, expectGen) {
+  // 强制约定：写入必须声明「我看到的是第几代」。
+  // - 异步路径（剪贴板、await 之后）：传读之前拿到的 gen
+  // - 同步路径（用户正在输入）：传 null，表示"就是当前这一轮"
+  // 不传 = 编程错误，直接抛，避免又出现一个"只按 id 写"的入口。
+  if (expectGen === undefined) {
+    throw new Error("patchRound: expectGen is required (pass null for synchronous writes)");
+  }
   const cur = state.rounds.get(id);
   if (!cur) return false;
-  if (expectGen !== undefined && cur.gen !== expectGen) return false;
+  if (expectGen !== null && cur.gen !== expectGen) return false;
   state.rounds.set(id, { ...cur, ...patch });
   return true;
 }
@@ -810,8 +817,8 @@ function copyGuide() {
 // 弹窗打开授权链接：noopener 让授权页拿不到 window.opener（防反向跳转劫持），
 // 代价是拿不到 handle，所以「用户是否回来了」靠 visibilitychange 判断。
 function openAuth(slot) {
-  roundFor(slot);
-  patchRound(slot.id, { opened: true });
+  const r = roundFor(slot);
+  patchRound(slot.id, { opened: true }, r.gen);
   window.open(slot.link, "authclip", "popup=yes,width=560,height=800,noopener");
   // noopener 时返回 null 是正常的，不能用它判断是否被拦。
   // 真弹窗会抢焦点，所以用「500ms 后本页是否还持有焦点」做启发式。
@@ -883,7 +890,10 @@ function memberCard(slot) {
   // 单一来源：这条任务的「当前轮次」。gen 一变则整份作废，
   // 表单、自动填入、已打开上下文都跟着失效。
   const round = roundFor(slot);
-  const set = (patch) => patchRound(slot.id, patch);
+  // 输入是同步的：写的就是当前这一轮，显式传 round.gen（轮次已变则写入被拒）
+  const set = (patch) => {
+    if (!patchRound(slot.id, patch, round.gen)) void refresh();
+  };
 
   const parsed = parseCallback(round.callback);
   const linkState = stateOfLink(slot.link);
@@ -1150,6 +1160,8 @@ window.addEventListener("focus", () => {
 });
 
 void start();
+
+
 
 
 

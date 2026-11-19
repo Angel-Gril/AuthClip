@@ -765,3 +765,46 @@ if (!patchRound(target.id, {...}, expectGen)) { 提示"轮次已变化，未填�
 正常路径（不换链）：
   自动填入 FRESH_OK 正常    ← 功能没被削弱
 ```
+
+## 二十六、v1.5.2：把「写入必须带代次」变成强制约定
+
+### 为什么还要再收一层
+
+v1.5.1 给 `patchRound` 加了可选参数 `expectGen`，但**可选参数 = 可以被忘记**。这类竞态已经以五种形状出现过（服务端 state → 草稿 gen → pending gen → round 对象 → await 窗口），每次都是"某个新入口忘了带代次"。
+
+### 现在的约定
+
+```js
+patchRound(id, patch, expectGen)   // expectGen 必填
+```
+
+- 不传 → **直接抛错**（`patchRound: expectGen is required`），不再静默按 id 写入
+- 同步写入（用户正在输入）→ 传 `round.gen`
+- 异步写入（剪贴板 await 之后）→ 传读取之前拿到的 gen
+- 代次不符 → 返回 `false`，不写入；调用方负责提示
+
+### 静态检查
+
+新增 `scripts/check-round-writes.mjs`：扫描 `web/app.js` 里所有 `patchRound(` 调用，参数少于 3 个就报错并给出行号。
+
+```bash
+$ node scripts/check-round-writes.mjs
+✓ 所有 patchRound 调用都显式传了代次
+
+# 故意去掉一个参数：
+✗ 1 处 patchRound 调用未显式传代次：
+  app.js:821  (2 个参数)  patchRound(slot.id, { opened: true })
+同步写入请传 null，异步写入请传读之前拿到的 gen。
+$ echo $?
+1
+```
+
+建议把这条加进 CI，与 `go vet` / `go test` / `govulncheck` 同一档。
+
+### 回归验证（浏览器内）
+
+```
+打字（同步写入，传 round.gen）         -> 输入保留          ✓
+自动填入（异步，传 expectGen）        -> AUTO_OK 填入      ✓
+换链窗口内自动填入（v1.5.1 场景）      -> 不写入、无泄漏    ✓
+```
