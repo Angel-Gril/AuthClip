@@ -55,7 +55,7 @@ const (
 	maxBody    = 128 << 10
 	maxLink    = 8192
 	sessionEC  = 20 * time.Second
-	appVersion = "v1.4.4" // v1.4.3: 换链清回传｜v1.4.4: 错配回传在卡片与复制处拦截
+	appVersion = "v1.4.5" // v1.4.4: 错配拦截｜v1.4.5: 链接代次防并发写回 / 管理员链接不可读
 )
 
 // ---------------------------------------------------------------- 模型
@@ -111,6 +111,10 @@ type Slot struct {
 	// 归档：A 端删除后从看板消失，但 B 仍能在自己的历史里看到
 	Deleted   bool      `json:"deleted"`
 	DeletedAt time.Time `json:"deleted_at"`
+
+	// LinkGen：换链接就 +1。回传必须带上它，防止"清空之后旧请求又写回来"。
+	// 只比 state 不够：新旧链接可能沿用同一个 state。
+	LinkGen int `json:"link_gen"`
 }
 
 func (s *Slot) filled() bool { return s.Code != "" || s.Email != "" }
@@ -527,7 +531,7 @@ func (s *store) createSlot(owner, member, label, link string) (*Slot, error) {
 	now := time.Now().UTC()
 	sl := &Slot{
 		ID: newToken()[:10], Owner: owner, Member: member, Label: label, Link: link,
-		Created: now, Updated: now, Rev: 1,
+		Created: now, Updated: now, Rev: 1, LinkGen: 1,
 	}
 	s.d.Slots = append(s.d.Slots, sl)
 	if err := s.saveLocked(); err != nil {
@@ -1096,8 +1100,16 @@ func (a *app) userLink(w http.ResponseWriter, r *http.Request, u *User) {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "该账号已吊销，恢复后再取链接"})
 		return
 	}
-	// 全局管理员本就持有全部权限（建号/删号/吊销/改派），
-	// 取链接不构成新的越权，因此不做角色限制。
+	// 只允许读「接收人」的链接：接收人链接只代表该接收人自己的任务。
+	// 管理员链接代表身份本身——读出来就能在该账号名下操作，
+	// 审计会记到被冒用者头上，事后无法分辨。管理员需要恢复访问时走 rotate
+	// （旧链接立即失效、动作记在操作者名下），由操作者私下把新链接交给本人。
+	if target.Role != "member" {
+		writeJSON(w, http.StatusForbidden, map[string]string{
+			"error": "管理员链接不可读取；如需恢复某管理员的访问，请用「重置链接」（旧链接立即失效，操作会记在你名下）",
+		})
+		return
+	}
 	// 底线：已吊销不给（上面已判）、每次取都落审计、审计失败就不给。
 	targetDesc := target.ID + ":" + target.Label + ":" + target.Role
 	if target.Role == "admin" {
@@ -1274,6 +1286,7 @@ func (a *app) rotateUser(w http.ResponseWriter, r *http.Request, u *User) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"id": fresh.ID, "username": fresh.Username, "label": fresh.Label,
 		"link": a.linkFor(fresh), "token": fresh.Token,
+		"warning": "旧链接已立即失效；请私下把新链接交给本人，此操作已记在你名下",
 	})
 }
 
@@ -1568,6 +1581,7 @@ func (a *app) patchSlot(w http.ResponseWriter, r *http.Request, u *User) {
 			// 换链接 = 新一轮授权。判定用「链接是否变化」而不是「state 是否变化」：
 			// 新链接沿用同一个 state 时，旧回传同样失效，必须清掉。
 			if next != s.Link {
+				s.LinkGen++ // 代次递增：清空与否都要递增，旧请求据此失效
 				if body.KeepResult != nil && *body.KeepResult {
 					// 显式保留（管理员认旧结果仍属于本轮），会单独留痕
 					relinkKept = true
@@ -1712,6 +1726,7 @@ func (a *app) report(w http.ResponseWriter, r *http.Request, u *User) {
 		RegIP     string `json:"reg_ip"`
 		RegRegion string `json:"reg_region"`
 		NodeIP    string `json:"node_ip"`
+		LinkGen   *int   `json:"link_gen"` // 必须回传页面看到的代次
 	}
 	if err := decode(w, r, &body); err != nil {
 		return
@@ -1780,6 +1795,20 @@ func (a *app) report(w http.ResponseWriter, r *http.Request, u *User) {
 		node = ip.Unmap().String()
 	}
 
+	// 代次校验：换过链接就必须重新取页面，否则旧请求会把上一轮结果写回来
+	if body.LinkGen == nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "缺少 link_gen：请刷新页面后重新提交",
+		})
+		return
+	}
+	if *body.LinkGen != sl.LinkGen {
+		writeJSON(w, http.StatusConflict, map[string]string{
+			"error": "授权链接已更换，请刷新页面查看新链接后重试",
+		})
+		return
+	}
+
 	// 服务端核对 OAuth 归属：回调里的 state 必须与当前授权链接里的 state 一致。
 	// 链接本身没有 state 时不再「跳过校验」，而是直接拒绝（无 state 即无法绑定）。
 	want := linkStateOf(sl.Link)
@@ -1805,6 +1834,11 @@ func (a *app) report(w http.ResponseWriter, r *http.Request, u *User) {
 		if s.Member != u.ID || s.Deleted {
 			denied = true
 			return errors.New("reassigned or archived")
+		}
+		// 提交期间可能刚被换链接：代次变了就直接拒（同 state 也能拦住）
+		if s.LinkGen != *body.LinkGen {
+			denied = true
+			return errors.New("link generation changed")
 		}
 		// 链接在提交期间被换掉：按新链接重新比一次
 		if cur := linkStateOf(s.Link); cur == "" || cur != stateParam {
@@ -2025,6 +2059,11 @@ func plausibleURL(s string) bool {
 	}
 	return host != "" && !strings.ContainsAny(host, " \t\r\n")
 }
+
+
+
+
+
 
 
 

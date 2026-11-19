@@ -83,6 +83,19 @@ func (e *env) call(t *testing.T, method, path, token string, body any) (int, map
 	return res.StatusCode, out
 }
 
+// report：自动带上页面当时的 link_gen（模拟正常前端）
+func (e *env) report(t *testing.T, token, id string, body map[string]any) (int, map[string]any) {
+	t.Helper()
+	if _, ok := body["link_gen"]; !ok {
+		gen := 1
+		if sl := e.app.st.slotByID(id); sl != nil {
+			gen = sl.LinkGen
+		}
+		body["link_gen"] = gen // 默认模拟"页面刚拿到的最新代次"
+	}
+	return e.call(t, "POST", "/api/slots/"+id+"/report", token, body)
+}
+
 func (e *env) newSlot(t *testing.T, member *User) string {
 	t.Helper()
 	code, out := e.call(t, "POST", "/api/slots", e.admin.Token, map[string]any{
@@ -99,7 +112,7 @@ func TestReassignClearsReturnedData(t *testing.T) {
 	id := e.newSlot(t, e.b1)
 
 	cb := "http://localhost:54545/callback?code=SECRET-CODE&state=STATE-ONE"
-	if code, out := e.call(t, "POST", "/api/slots/"+id+"/report", e.b1.Token, map[string]any{
+	if code, out := e.report(t, e.b1.Token, id, map[string]any{
 		"email": "b1@example.com", "callback": cb, "reg_ip": "1.2.3.4", "reg_region": "US", "node_ip": "5.6.7.8",
 	}); code != http.StatusOK {
 		t.Fatalf("report: %d %v", code, out)
@@ -130,7 +143,7 @@ func TestReportAfterReassignRejected(t *testing.T) {
 	if _, out := e.call(t, "PATCH", "/api/slots/"+id, e.admin.Token, map[string]any{"member": e.b2.ID}); out == nil {
 		t.Fatal("reassign failed")
 	}
-	code, _ := e.call(t, "POST", "/api/slots/"+id+"/report", e.b1.Token, map[string]any{
+	code, _ := e.report(t, e.b1.Token, id, map[string]any{
 		"email": "b1@example.com", "callback": "http://localhost:54545/callback?code=X&state=STATE-ONE",
 	})
 	if code != http.StatusNotFound {
@@ -149,7 +162,7 @@ func TestReportRejectsForeignState(t *testing.T) {
 			body[k] = v
 		}
 		body["callback"] = callback
-		return e.call(t, "POST", "/api/slots/"+id+"/report", e.b1.Token, body)
+		return e.report(t, e.b1.Token, id, body)
 	}
 
 	if code, _ := with("http://localhost:54545/callback?code=OTHER&state=STATE-TWO"); code != http.StatusConflict {
@@ -370,7 +383,7 @@ func TestArchiveKeepsMemberHistory(t *testing.T) {
 	e := newEnv(t, "")
 	id := e.newSlot(t, e.b1)
 	cb := "http://localhost:54545/callback?code=ARCH1&state=STATE-ONE"
-	if code, _ := e.call(t, "POST", "/api/slots/"+id+"/report", e.b1.Token, map[string]any{"email": "b1@example.com", "callback": cb}); code != http.StatusOK {
+	if code, _ := e.report(t, e.b1.Token, id, map[string]any{"email": "b1@example.com", "callback": cb}); code != http.StatusOK {
 		t.Fatalf("report: %d", code)
 	}
 	// 管理员归档
@@ -392,7 +405,7 @@ func TestArchiveKeepsMemberHistory(t *testing.T) {
 		t.Fatalf("历史内容不对：%v", s)
 	}
 	// 归档后不能再回传
-	if code, _ := e.call(t, "POST", "/api/slots/"+id+"/report", e.b1.Token, map[string]any{"email": "b1@example.com", "callback": cb}); code == http.StatusOK {
+	if code, _ := e.report(t, e.b1.Token, id, map[string]any{"email": "b1@example.com", "callback": cb}); code == http.StatusOK {
 		t.Fatal("归档任务仍可回传")
 	}
 }
@@ -431,7 +444,7 @@ func TestOwnScopeCannotCreateMember(t *testing.T) {
 func TestExportCSV(t *testing.T) {
 	e := newEnv(t, "")
 	id := e.newSlot(t, e.b1)
-	e.call(t, "POST", "/api/slots/"+id+"/report", e.b1.Token, map[string]any{
+	e.report(t, e.b1.Token, id, map[string]any{
 		"email": "b1@example.com", "callback": "http://localhost:54545/callback?code=EXP1&state=STATE-ONE",
 	})
 	e.call(t, "DELETE", "/api/slots/"+id, e.admin.Token, nil) // 归档的也要出现在导出里
@@ -531,18 +544,18 @@ func TestReportRequiresFullCallbackURL(t *testing.T) {
 
 	// 裸授权码：拒
 	body := map[string]any{"email": "b@example.com", "code": "BARE-CODE-ONLY"}
-	if code, _ := e.call(t, "POST", "/api/slots/"+id+"/report", e.b1.Token, body); code != http.StatusBadRequest {
+	if code, _ := e.report(t, e.b1.Token, id, body); code != http.StatusBadRequest {
 		t.Fatalf("裸 code 应被拒，实际 %d", code)
 	}
 	// 有 URL 但没 state：拒
 	_ = base
 	body = map[string]any{"email": "b@example.com", "callback": "http://localhost:54545/callback?code=X"}
-	if code, _ := e.call(t, "POST", "/api/slots/"+id+"/report", e.b1.Token, body); code != http.StatusBadRequest {
+	if code, _ := e.report(t, e.b1.Token, id, body); code != http.StatusBadRequest {
 		t.Fatalf("缺 state 的回调应被拒，实际 %d", code)
 	}
 	// 完整且 state 匹配：通过
 	body = map[string]any{"email": "b@example.com", "callback": "http://localhost:54545/callback?code=OK&state=STATE-ONE"}
-	if code, out := e.call(t, "POST", "/api/slots/"+id+"/report", e.b1.Token, body); code != http.StatusOK {
+	if code, out := e.report(t, e.b1.Token, id, body); code != http.StatusOK {
 		t.Fatalf("完整回调应通过，实际 %d %v", code, out)
 	}
 }
@@ -550,7 +563,7 @@ func TestReportRequiresFullCallbackURL(t *testing.T) {
 func TestExportIsMaskedByDefaultAndAuditedFirst(t *testing.T) {
 	e := newEnv(t, "")
 	id := e.newSlot(t, e.b1)
-	e.call(t, "POST", "/api/slots/"+id+"/report", e.b1.Token, map[string]any{
+	e.report(t, e.b1.Token, id, map[string]any{
 		"email": "b1@example.com", "callback": "http://localhost:54545/callback?code=SUPERSECRETCODE&state=STATE-ONE",
 	})
 
@@ -753,42 +766,37 @@ func TestUsernameBackfilledForLegacyData(t *testing.T) {
 
 // ---------------------------------------------------------------- v1.4.1
 
-// 全局管理员可以取任意账号（含其他管理员）的链接：这是有意的策略，
-// 因为他本就拥有建号/删号/吊销/改派权限。这里锁住的是「必须留审计」。
-func TestGlobalAdminMayFetchAnyLinkButAlwaysAudited(t *testing.T) {
+// 管理员链接不可读：读出来就能以对方身份操作，而审计会记成被冒用者。
+// 恢复访问走 rotate（旧链接立即失效，动作记在操作者名下）。
+func TestAdminLinkNotReadableButRotatable(t *testing.T) {
 	e := newEnv(t, "")
 	other, err := e.app.st.addUser("admin", "own", "A3", "a3")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// 取另一个管理员 -> 200
-	code, body := e.call(t, "GET", "/api/users/"+other.ID+"/link", e.admin.Token, nil)
-	if code != http.StatusOK {
-		t.Fatalf("取管理员链接应 200，实际 %d %v", code, body)
+	// 取任何管理员（他人或自己）的链接 -> 403
+	for _, id := range []string{other.ID, e.admin.ID} {
+		if code, body := e.call(t, "GET", "/api/users/"+id+"/link", e.admin.Token, nil); code != http.StatusForbidden {
+			t.Fatalf("取管理员链接应 403，实际 %d %v", code, body)
+		}
 	}
-	if link, _ := body["link"].(string); !strings.Contains(link, "#a="+other.Token) {
+	// 取接收人 -> 200，且留 user.link 审计
+	code, body := e.call(t, "GET", "/api/users/"+e.b1.ID+"/link", e.admin.Token, nil)
+	if code != http.StatusOK {
+		t.Fatalf("取接收人链接应 200，实际 %d %v", code, body)
+	}
+	if link, _ := body["link"].(string); !strings.Contains(link, "#b="+e.b1.Token) {
 		t.Fatalf("返回的链接不对：%v", body)
 	}
-	// 取自己 -> 200
-	if code, _ := e.call(t, "GET", "/api/users/"+e.admin.ID+"/link", e.admin.Token, nil); code != http.StatusOK {
-		t.Fatalf("取自己链接应 200，实际 %d", code)
-	}
-	// 取接收人 -> 200
-	if code, _ := e.call(t, "GET", "/api/users/"+e.b1.ID+"/link", e.admin.Token, nil); code != http.StatusOK {
-		t.Fatalf("取接收人链接应 200，实际 %d", code)
-	}
-
-	// 每次都留审计，且区分角色
-	rows := e.app.st.audit(50)
 	links := 0
-	for _, r := range rows {
+	for _, r := range e.app.st.audit(50) {
 		if r.Action == "user.link" {
 			links++
 		}
 	}
-	if links != 3 {
-		t.Fatalf("应有 3 条 user.link 审计，实际 %d", links)
+	if links != 1 {
+		t.Fatalf("应只有 1 条 user.link 审计（管理员被拒的两次不写），实际 %d", links)
 	}
 
 	// 轮换另一个管理员：允许，但会作废旧链接
@@ -812,7 +820,7 @@ func TestGlobalAdminMayFetchAnyLinkButAlwaysAudited(t *testing.T) {
 func TestAuditFailureBlocksSensitiveOutput(t *testing.T) {
 	e := newEnv(t, "")
 	id := e.newSlot(t, e.b1)
-	e.call(t, "POST", "/api/slots/"+id+"/report", e.b1.Token, map[string]any{
+	e.report(t, e.b1.Token, id, map[string]any{
 		"email": "b1@example.com", "callback": "http://localhost:54545/callback?code=SECRET&state=STATE-ONE",
 	})
 
@@ -854,7 +862,7 @@ func TestAuditFailureBlocksSensitiveOutput(t *testing.T) {
 func TestRelinkClearsPreviousResult(t *testing.T) {
 	e := newEnv(t, "")
 	id := e.newSlot(t, e.b1)
-	e.call(t, "POST", "/api/slots/"+id+"/report", e.b1.Token, map[string]any{
+	e.report(t, e.b1.Token, id, map[string]any{
 		"email": "old@example.com", "callback": "http://localhost:54545/callback?code=OLD&state=STATE-ONE",
 	})
 	newLink := strings.Replace(testLink, "STATE-ONE", "STATE-TWO", 1)
@@ -877,7 +885,7 @@ func TestRelinkClearsPreviousResult(t *testing.T) {
 		t.Fatal("换链接未记 slot.relink 审计")
 	}
 	// 同一条链接重复提交（state 不变）不应清空
-	e.call(t, "POST", "/api/slots/"+id+"/report", e.b1.Token, map[string]any{
+	e.report(t, e.b1.Token, id, map[string]any{
 		"email": "b2@example.com", "callback": "http://localhost:54545/callback?code=NEW&state=STATE-TWO",
 	})
 	if code, _ := e.call(t, "PATCH", "/api/slots/"+id, e.admin.Token, map[string]any{"link": newLink}); code != http.StatusOK {
@@ -898,7 +906,7 @@ func TestRelinkClearsRegardlessOfState(t *testing.T) {
 
 	fill := func(code, state string) {
 		t.Helper()
-		if c, out := e.call(t, "POST", "/api/slots/"+id+"/report", e.b1.Token, map[string]any{
+		if c, out := e.report(t, e.b1.Token, id, map[string]any{
 			"email": "x@example.com", "callback": "http://localhost:54545/callback?code=" + code + "&state=" + state,
 		}); c != http.StatusOK {
 			t.Fatalf("report: %d %v", c, out)
@@ -941,5 +949,53 @@ func TestRelinkClearsRegardlessOfState(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("显式保留未留痕（slot.relink.keep）")
+	}
+}
+
+
+
+
+// v1.4.5：换链接与提交并发 —— 同 state 也要拦住旧请求
+func TestReportRejectedAfterRelinkEvenWithSameState(t *testing.T) {
+	e := newEnv(t, "")
+	id := e.newSlot(t, e.b1)
+	gen := e.app.st.slotByID(id).LinkGen
+
+	// 旧页面提交一次（成功）
+	cb := "http://localhost:54545/callback?code=ROUND1&state=STATE-ONE"
+	if c, out := e.report(t, e.b1.Token, id, map[string]any{"email": "a@example.com", "callback": cb, "link_gen": gen}); c != http.StatusOK {
+		t.Fatalf("首次提交失败：%d %v", c, out)
+	}
+
+	// 管理员换链接，但 state 不变（只改 challenge）
+	sameState := strings.Replace(testLink, "CHAL", "CHAL2", 1)
+	if c, _ := e.call(t, "PATCH", "/api/slots/"+id, e.admin.Token, map[string]any{"link": sameState}); c != http.StatusOK {
+		t.Fatal("换链接失败")
+	}
+	if got := e.app.st.slotByID(id).LinkGen; got <= gen {
+		t.Fatalf("换链接后代次应递增，实际 %d -> %d", gen, got)
+	}
+
+	// 旧页面（旧代次）再提交：必须 409，不能把上一轮结果写回来
+	if c, out := e.report(t, e.b1.Token, id, map[string]any{
+		"email": "a@example.com", "callback": cb, "link_gen": gen,
+	}); c != http.StatusConflict {
+		t.Fatalf("旧代次提交应 409，实际 %d %v", c, out)
+	}
+	if sl := e.app.st.slotByID(id); sl.Code != "" {
+		t.Fatalf("旧请求不该写回数据，实际 code=%q", sl.Code)
+	}
+
+	// 刷新后的页面（新代次）可以提交
+	if c, out := e.report(t, e.b1.Token, id, map[string]any{
+		"email": "a@example.com", "callback": "http://localhost:54545/callback?code=ROUND2&state=STATE-ONE",
+	}); c != http.StatusOK {
+		t.Fatalf("新代次提交应成功，实际 %d %v", c, out)
+	}
+
+	// 完全不带 link_gen：400（要求前端把代次带上）
+	var raw map[string]any = map[string]any{"email": "a@example.com", "callback": cb}
+	if c, _ := e.call(t, "POST", "/api/slots/"+id+"/report", e.b1.Token, raw); c != http.StatusBadRequest {
+		t.Fatalf("缺 link_gen 应 400，实际 %d", c)
 	}
 }

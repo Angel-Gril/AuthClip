@@ -895,6 +895,7 @@ function memberCard(slot) {
           reg_ip: regIp.value,
           reg_region: regRegion.value,
           node_ip: nodeIp.value,
+          link_gen: slot.link_gen ?? 0,
         },
       });
       state.drafts.delete(slot.id);
@@ -1089,6 +1090,7 @@ window.addEventListener("focus", () => {
 });
 
 void start();
+
 
 
 
