@@ -55,7 +55,7 @@ const (
 	maxBody    = 128 << 10
 	maxLink    = 8192
 	sessionEC  = 20 * time.Second
-	appVersion = "v1.4.1" // v1.4.0: 唯一用户名｜v1.4.1: 管理员链接不可取 / 审计失败拒答 / 换链清旧回传
+	appVersion = "v1.4.2" // v1.4.1: 审计 fail-closed / 换链清旧回传｜v1.4.2: 全局管理员可取任意链接（留审计）
 )
 
 // ---------------------------------------------------------------- 模型
@@ -1096,19 +1096,15 @@ func (a *app) userLink(w http.ResponseWriter, r *http.Request, u *User) {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "该账号已吊销，恢复后再取链接"})
 		return
 	}
-	// 只允许取「接收人」的链接。管理员的链接一旦外流就是身份接管，
-	// 任何管理者都不得通过 API 取得他人的 #a=；需要恢复用自己的长期链接，
-	// 或用服务器本地的 CLI（authclip link admin 标签）。
-	if target.Role != "member" {
-		writeJSON(w, http.StatusForbidden, map[string]string{
-			"error": "不能通过接口取管理员链接；管理员链接只在创建时下发，遗失请用服务器上的 CLI 重新签发",
-		})
-		return
+	// 全局管理员本就持有全部权限（建号/删号/吊销/改派），
+	// 取链接不构成新的越权，因此不做角色限制。
+	// 底线：已吊销不给（上面已判）、每次取都落审计、审计失败就不给。
+	targetDesc := target.ID + ":" + target.Label + ":" + target.Role
+	if target.Role == "admin" {
+		targetDesc += ":" + target.scopeOf()
 	}
-	// 审计失败就不给链接（fail-closed）
 	if err := a.st.appendAudit(&Audit{
-		Actor: u.ID, Label: u.Label, Action: "user.link",
-		Target: target.ID + ":" + target.Label,
+		Actor: u.ID, Label: u.Label, Action: "user.link", Target: targetDesc,
 	}); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{
 			"error": "审计写入失败，已拒绝返回链接",
@@ -1255,14 +1251,10 @@ func (a *app) rotateUser(w http.ResponseWriter, r *http.Request, u *User) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "不能轮换自己"})
 		return
 	}
-	// 与 userLink 同一条红线：不能替别的管理员签发新链接（等于接管其身份）
+	// 全局管理员可重置任何账号的链接（含其他管理员）；
+	// 唯一例外是不能重置自己——那只会让自己当前链接失效，属于误操作。
 	if target := a.st.userByID(id); target == nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "账号不存在"})
-		return
-	} else if target.Role != "member" {
-		writeJSON(w, http.StatusForbidden, map[string]string{
-			"error": "不能轮换管理员链接；管理员链接遗失请在服务器上用 CLI 重新签发",
-		})
 		return
 	}
 	var fresh *User
@@ -2024,6 +2016,8 @@ func plausibleURL(s string) bool {
 	}
 	return host != "" && !strings.ContainsAny(host, " \t\r\n")
 }
+
+
 
 
 

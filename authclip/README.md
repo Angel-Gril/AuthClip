@@ -467,3 +467,35 @@ PASS TestCannotFetchOrRotateAdminLink      管理员链接 403（他人/自己�
 PASS TestAuditFailureBlocksSensitiveOutput 写盘失败时导出/取链接 500 且不含数据
 PASS TestRelinkClearsPreviousResult        换 state 清回传并记 slot.relink；同 state 不清
 ```
+
+## 十八、v1.4.2：管理员链接可取（策略调整）
+
+v1.4.1 把 `GET /api/users/{id}/link` 与 `rotate` 收紧成"只能操作接收人"，实际使用中会卡住：
+
+- 全量管理员**本就已经**拥有建号 / 删号 / 吊销 / 改派 / 改范围的全部权限；
+- 藏起链接不构成任何额外防护，只是让"帮同事找回链接"变成必须登服务器跑 CLI；
+- 真正需要防的不是"管理员能拿"，而是"拿了没痕迹"。
+
+因此 v1.4.2 放开角色限制，保留三条底线：
+
+| 底线 | 行为 |
+| :--- | :--- |
+| 已吊销账号 | `409`，不给链接（避免用吊销身份继续操作） |
+| 每次取用都留审计 | `user.link`，target 记录 `id:标签:角色[:范围]`，管理员目标可区分 |
+| 审计失败即拒答 | 落盘失败 → `500`，不返回链接（fail-closed） |
+| 不能轮换自己 | `400`：那只会让自己当前链接立即失效，属误操作 |
+
+实测（同一实例，全局管理员 A）：
+
+```
+admin/a      -> http://…/#a=dk2wwwzzw7kaql5…     ← 自己
+admin/a2     -> http://…/#a=2mbhfqltymnkddm…     ← 另一个管理员
+member/b1    -> http://…/#b=z4kxhiijac5tgbu…     ← 接收人
+审计 target:  2ukekktbhq:A-主号:admin:all
+              ehg6ar2u4m:A2-限自己:admin:own
+              hd2mzjqcxj:B1-家宽:member
+```
+
+仍然保留 v1.4.1 的另外两条修复：审计 fail-closed、换链接清旧回传。
+
+测试：`TestGlobalAdminMayFetchAnyLinkButAlwaysAudited`（取任意账号 200、三条审计、轮换他人允许、轮换自己 400、吊销 409），共 25 个全绿。

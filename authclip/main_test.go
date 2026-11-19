@@ -753,31 +753,59 @@ func TestUsernameBackfilledForLegacyData(t *testing.T) {
 
 // ---------------------------------------------------------------- v1.4.1
 
-func TestCannotFetchOrRotateAdminLink(t *testing.T) {
+// 全局管理员可以取任意账号（含其他管理员）的链接：这是有意的策略，
+// 因为他本就拥有建号/删号/吊销/改派权限。这里锁住的是「必须留审计」。
+func TestGlobalAdminMayFetchAnyLinkButAlwaysAudited(t *testing.T) {
 	e := newEnv(t, "")
-	// 再造一个全量管理员，作为「别人」
-	other, err := e.app.st.addUser("admin", "all", "A3", "a3")
+	other, err := e.app.st.addUser("admin", "own", "A3", "a3")
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 取另一个管理员的链接：403
-	if code, _ := e.call(t, "GET", "/api/users/"+other.ID+"/link", e.admin.Token, nil); code != http.StatusForbidden {
-		t.Fatalf("取管理员链接应 403，实际 %d", code)
+
+	// 取另一个管理员 -> 200
+	code, body := e.call(t, "GET", "/api/users/"+other.ID+"/link", e.admin.Token, nil)
+	if code != http.StatusOK {
+		t.Fatalf("取管理员链接应 200，实际 %d %v", code, body)
 	}
-	// 取自己的链接也不行（同样走 403 分支，避免"顺手看一眼"）
-	if code, _ := e.call(t, "GET", "/api/users/"+e.admin.ID+"/link", e.admin.Token, nil); code != http.StatusForbidden {
-		t.Fatalf("取自己链接应 403，实际 %d", code)
+	if link, _ := body["link"].(string); !strings.Contains(link, "#a="+other.Token) {
+		t.Fatalf("返回的链接不对：%v", body)
 	}
-	// 轮换另一个管理员：403，且其 token 不变
-	if code, _ := e.call(t, "POST", "/api/users/"+other.ID+"/rotate", e.admin.Token, map[string]any{}); code != http.StatusForbidden {
-		t.Fatalf("轮换管理员应 403，实际 %d", code)
+	// 取自己 -> 200
+	if code, _ := e.call(t, "GET", "/api/users/"+e.admin.ID+"/link", e.admin.Token, nil); code != http.StatusOK {
+		t.Fatalf("取自己链接应 200，实际 %d", code)
 	}
-	if again := e.app.st.userByID(other.ID); again == nil || again.Token != other.Token {
-		t.Fatal("管理员 token 被改动了")
-	}
-	// 接收人的链接仍然可娶
+	// 取接收人 -> 200
 	if code, _ := e.call(t, "GET", "/api/users/"+e.b1.ID+"/link", e.admin.Token, nil); code != http.StatusOK {
 		t.Fatalf("取接收人链接应 200，实际 %d", code)
+	}
+
+	// 每次都留审计，且区分角色
+	rows := e.app.st.audit(50)
+	links := 0
+	for _, r := range rows {
+		if r.Action == "user.link" {
+			links++
+		}
+	}
+	if links != 3 {
+		t.Fatalf("应有 3 条 user.link 审计，实际 %d", links)
+	}
+
+	// 轮换另一个管理员：允许，但会作废旧链接
+	if code, _ := e.call(t, "POST", "/api/users/"+other.ID+"/rotate", e.admin.Token, map[string]any{}); code != http.StatusOK {
+		t.Fatalf("轮换其他管理员应 200，实际 %d", code)
+	}
+	if again := e.app.st.userByID(other.ID); again == nil || again.Token == other.Token {
+		t.Fatal("轮换后 token 应变化")
+	}
+	// 轮换自己：拒绝
+	if code, _ := e.call(t, "POST", "/api/users/"+e.admin.ID+"/rotate", e.admin.Token, map[string]any{}); code != http.StatusBadRequest {
+		t.Fatalf("轮换自己应 400，实际 %d", code)
+	}
+	// 已吊销账号：409
+	e.call(t, "PATCH", "/api/users/"+e.b1.ID, e.admin.Token, map[string]any{"revoke": true})
+	if code, _ := e.call(t, "GET", "/api/users/"+e.b1.ID+"/link", e.admin.Token, nil); code != http.StatusConflict {
+		t.Fatalf("吊销后应 409，实际 %d", code)
 	}
 }
 
@@ -859,3 +887,4 @@ func TestRelinkClearsPreviousResult(t *testing.T) {
 		t.Fatalf("同一 state 的重复写不应清空回传，实际 code=%q", sl2.Code)
 	}
 }
+
