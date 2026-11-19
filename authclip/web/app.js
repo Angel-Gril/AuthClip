@@ -20,9 +20,10 @@ const state = {
   feedback: "",
   feedbackKind: "",
   busy: false,
-  drafts: new Map(),
+  // 每个任务只有一份「当前轮次」状态：gen 一变整份作废。
+  // 所有入口（打开授权、自动填入、手动粘贴、按钮）只读写它。
+  rounds: new Map(),
   reveal: new Set(),
-  pending: null, // { id, gen }：打开授权页时的任务与代次
   stopStream: null,
 };
 
@@ -154,23 +155,39 @@ function stopStream() {
   state.stopStream = null;
 }
 
-// 换链接后，按任务 ID 存的旧草稿必须作废：
-// 否则刷新拿到新 link_gen 再把旧回调提交上去，等于替上一轮数据"洗白"。
-function dropStaleDrafts() {
-  const slots = state.mine.slots || [];
-  const gen = new Map(slots.map((s) => [s.id, s.link_gen ?? 0]));
+// 「当前授权轮次」的唯一载体：按任务 id 存一份，带 link_gen。
+// gen 与服务器不一致 = 换了链接 = 整份作废（表单、自动填入、已打开上下文一起失效）。
+function roundFor(slot) {
+  const gen = slot.link_gen ?? 0;
+  const cur = state.rounds.get(slot.id);
+  if (cur && cur.gen === gen) return cur;
+  const fresh = {
+    gen,
+    opened: false, // 是否点开过授权链接（自动填入的前提）
+    callback: slot.callback || "",
+    email: slot.email || "",
+    regIp: slot.reg_ip || state.mine.seen?.ip || "",
+    regRegion: slot.reg_region || state.mine.seen?.region || "",
+    nodeIp: slot.node_ip || "",
+  };
+  state.rounds.set(slot.id, fresh);
+  return fresh;
+}
+
+function patchRound(id, patch) {
+  const cur = state.rounds.get(id);
+  if (!cur) return;
+  state.rounds.set(id, { ...cur, ...patch });
+}
+
+function dropStaleRounds() {
+  const gen = new Map((state.mine.slots || []).map((s) => [s.id, s.link_gen ?? 0]));
   let dropped = 0;
-  for (const [id, d] of state.drafts) {
-    const live = gen.get(id);
-    if (live === undefined || (d.gen ?? 0) !== live) {
-      state.drafts.delete(id);
+  for (const [id, r] of state.rounds) {
+    if (gen.get(id) !== r.gen) {
+      state.rounds.delete(id);
       dropped++;
     }
-  }
-  // 待自动填入的上下文也要一起作废（否则切回来会用剪贴板里的旧回调）
-  if (state.pending && gen.get(state.pending.id) !== state.pending.gen) {
-    state.pending = null;
-    dropped++;
   }
   if (dropped > 0) {
     state.feedback = "授权链接已更新，之前的草稿已清空，请重新粘贴回调链接。";
@@ -184,7 +201,7 @@ async function refresh() {
       state.board = await api("/api/board");
     } else {
       state.mine = await api("/api/mine");
-      dropStaleDrafts();
+      dropStaleRounds();
     }
   } catch (e) {
     if (e.status === 401) {
@@ -789,36 +806,32 @@ function copyGuide() {
 // 弹窗打开授权链接：noopener 让授权页拿不到 window.opener（防反向跳转劫持），
 // 代价是拿不到 handle，所以「用户是否回来了」靠 visibilitychange 判断。
 function openAuth(slot) {
-  state.pending = { id: slot.id, gen: slot.link_gen ?? 0 };
-  const w = window.open(slot.link, "authclip", "popup=yes,width=560,height=800,noopener");
+  roundFor(slot);
+  patchRound(slot.id, { opened: true });
+  window.open(slot.link, "authclip", "popup=yes,width=560,height=800,noopener");
   // noopener 时返回 null 是正常的，不能用它判断是否被拦。
   // 真弹窗会抢焦点，所以用「500ms 后本页是否还持有焦点」做启发式。
   setTimeout(() => {
     if (document.hasFocus()) flash("没看到弹窗？用「复制链接」在浏览器里打开也一样。");
   }, 500);
-  void w;
 }
 
-// 用户从授权页切回来时，自动尝试读剪贴板并填入（没权限就静默跳过，不打扰）
+// 从授权页切回时自动读剪贴板。
+// 唯一判据：这条任务的 round 仍属于当前轮次、且被打开过。
+// round 随 link_gen 变化整份丢弃，所以不存在「跨轮次自动填入」。
 async function tryAutoPaste() {
-  const pend = state.pending;
-  if (!pend || state.role !== "member") return;
-  // 打开授权页之后可能发生过换链：代次不符就不再自动填，
-  // 否则剪贴板里的上一轮回调会被挂到新一轮任务上。
-  const slot = (state.mine.slots || []).find((s) => s.id === pend.id);
-  if (!slot || (slot.link_gen ?? 0) !== pend.gen) {
-    state.pending = null;
-    flash("授权链接已更换，请重新打开授权链接后再复制回调。", "err");
-    return;
-  }
+  if (state.role !== "member") return;
+  const target = (state.mine.slots || []).find((s) => {
+    if (s.deleted) return false;
+    const r = state.rounds.get(s.id);
+    return r && r.opened && r.gen === (s.link_gen ?? 0);
+  });
+  if (!target) return;
   try {
     const text = await navigator.clipboard.readText();
     const p = parseCallback(text);
     if (!p?.code) return;
-    const gen = slot.link_gen ?? 0;
-    const cur = state.drafts.get(pend.id) || { gen };
-    state.drafts.set(pend.id, { ...cur, callback: text, gen });
-    state.pending = null;
+    patchRound(target.id, { callback: text, opened: false });
     flash("已从剪贴板自动填入 code，核对后提交");
   } catch { /* 没有剪贴板权限：留给按钮 */ }
 }
@@ -852,34 +865,24 @@ function memberCard(slot) {
     );
   }
 
-  const draft = state.drafts.get(slot.id) || {
-    gen: slot.link_gen ?? 0,
-    email: slot.email || "",
-    callback: slot.callback || "",
-    regIp: slot.reg_ip || state.mine.seen?.ip || "",
-    regRegion: slot.reg_region || state.mine.seen?.region || "",
-    nodeIp: slot.node_ip || "",
-  };
-  // 每次输入都合并进当前草稿：不能直接用闭包里那份 draft，
-  // 否则表单重渲染后旧闭包会把它覆盖回去（丢字段）
-  const set = (patch) => {
-    const cur = state.drafts.get(slot.id) || draft;
-    state.drafts.set(slot.id, { ...cur, ...patch });
-  };
+  // 单一来源：这条任务的「当前轮次」。gen 一变则整份作废，
+  // 表单、自动填入、已打开上下文都跟着失效。
+  const round = roundFor(slot);
+  const set = (patch) => patchRound(slot.id, patch);
 
-  const parsed = parseCallback(draft.callback);
+  const parsed = parseCallback(round.callback);
   const linkState = stateOfLink(slot.link);
   const match = parsed && parsed.state && linkState ? (parsed.state === linkState) : null;
 
   const email = el("input", { type: "email", autocomplete: "off", maxlength: 254, placeholder: "注册这个账号用的邮箱" });
-  email.value = draft.email;
+  email.value = round.email;
   email.addEventListener("input", () => set({ email: email.value }));
 
   const callback = el("textarea", {
     class: "tall", spellcheck: "false",
     placeholder: "把地址栏那条 http://localhost:54545/callback?code=…&state=… 整条粘进来",
   });
-  callback.value = draft.callback;
+  callback.value = round.callback;
   const handlePaste = () => {
     const text = callback.value;
     set({ callback: text });
@@ -907,15 +910,15 @@ function memberCard(slot) {
   };
 
   const regIp = el("input", { placeholder: "注册区域 IP（默认填服务端观测值）" });
-  regIp.value = draft.regIp;
+  regIp.value = round.regIp;
   regIp.addEventListener("input", () => set({ regIp: regIp.value }));
 
   const regRegion = el("input", { maxlength: 2, placeholder: "US" });
-  regRegion.value = draft.regRegion;
+  regRegion.value = round.regRegion;
   regRegion.addEventListener("input", () => set({ regRegion: regRegion.value.toUpperCase() }));
 
   const nodeIp = el("input", { placeholder: "静态家宽节点 IP（选填）" });
-  nodeIp.value = draft.nodeIp;
+  nodeIp.value = round.nodeIp;
   nodeIp.addEventListener("input", () => set({ nodeIp: nodeIp.value }));
 
   const submit = async (event) => {
@@ -931,10 +934,10 @@ function memberCard(slot) {
           reg_ip: regIp.value,
           reg_region: regRegion.value,
           node_ip: nodeIp.value,
-          link_gen: draft.gen ?? slot.link_gen ?? 0,
+          link_gen: roundFor(slot).gen,
         },
       });
-      state.drafts.delete(slot.id);
+      state.rounds.delete(slot.id);
       flash("已回传，对方会立刻看到；再提交一次可覆盖");
       await refresh();
     } catch (e) {
@@ -994,7 +997,7 @@ function memberCard(slot) {
         el("button", { class: "primary", type: "submit", text: slot.code ? "更新回传" : "提交回传", disabled: state.busy }),
         el("button", { type: "button", text: "用观测值填 IP/地区", onclick: () => {
           const seen = state.mine.seen || {};
-          set({ regIp: seen.ip || draft.regIp, regRegion: seen.region || draft.regRegion });
+          set({ regIp: seen.ip || round.regIp, regRegion: seen.region || round.regRegion });
           render();
         } }),
       ),
@@ -1119,13 +1122,17 @@ document.addEventListener("visibilitychange", () => {
   if (document.visibilityState !== "visible" || !state.token) return;
   void refresh();
   // 从授权小窗切回来：先给剪贴板一点写入时间，再尝试自动填入
-  if (state.pending) setTimeout(() => void tryAutoPaste(), 300);
+  setTimeout(() => void tryAutoPaste(), 300);
 });
 window.addEventListener("focus", () => {
-  if (state.pending) void tryAutoPaste();
+  void tryAutoPaste();
 });
 
 void start();
+
+
+
+
 
 
 

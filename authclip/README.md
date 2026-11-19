@@ -679,3 +679,46 @@ A 端换链（state 仍为 SAME，gen -> 2）
 ```
 
 即：跨轮次的自动填入被拦住，正常一轮内的自动填入不受影响。
+
+## 二十四、v1.5.0：把「当前授权轮次」收敛成一个对象
+
+### 为什么会连着漏三轮
+
+v1.4.5 → v1.4.7 连续被指出同一类问题：
+
+| 版本 | 漏的地方 |
+| :--- | :--- |
+| v1.4.5 | 服务端只比 `state`，不比轮次 |
+| v1.4.6 | 浏览器表单草稿没跟代次 |
+| v1.4.7 | 自动填入的 `pending` 没跟代次 |
+
+根因不是"又漏了一处校验"，而是**「这一轮授权」这个概念散落在三处状态里**：
+服务端 `link_gen`、草稿 `draft.gen`、自动填入上下文 `pending.gen`。每加一个入口（点开链接、自动填入、手动粘贴、按钮）就要人工记得同步一次，于是每轮都能被抓到一处没同步。
+
+### 收敛后的结构
+
+```js
+state.rounds : Map<slotId, Round>
+Round = {
+  gen,          // 生成时的 link_gen
+  opened,       // 是否点开过授权链接（自动填入的前提）
+  callback, email, regIp, regRegion, nodeIp   // 本轮表单内容
+}
+```
+
+- **唯一读写入口**：`roundFor(slot)`（gen 不符就整份重建）、`patchRound(id, patch)`
+- **唯一失效点**：`dropStaleRounds()`，每次 `/api/mine` 刷新后跑一遍，gen 不符即 `.delete()`
+- 表单、自动填入、"读剪贴板"按钮、提交，全部只碰这个对象；不再有第二份 `gen`
+- `openAuth()` 只做一件事：`patchRound(id, { opened: true })`
+- `tryAutoPaste()` 的判据：存在 `opened && gen === slot.link_gen` 的 round，否则直接返回
+
+### 实测（浏览器内，真 SSE）
+
+```
+正常一轮：点开 A -> focus -> 自动填入 FRESH_A        ✓
+B 也点开后 A 端换链（gen 1->2，state 不变）
+  B 的输入框：空（round 随 gen 丢弃）                ✓
+  A 的草稿：仍在（别的任务，不受影响）                ✓
+```
+
+顺带解决了旧实现的另一个缺陷：`pendingSlot` 只能记住**一个**任务，同时开两条任务时自动填入会串；现在每个任务各有一份 round。
