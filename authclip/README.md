@@ -399,3 +399,43 @@ v1.3.2 折中：
 ```
 
 新增测试 `TestLinkRevealIsPerRequestAndAudited`（共 20 个）：列表无 token、单条可取、own 范围 403、吊销 409、审计留痕。
+
+## 十六、按用户名下发（v1.4.0）
+
+之前下拉框里是 `标签 · id前4位`，而**标签不唯一**（两个「B-家宽」就分不清）。v1.4 给每个账号加了唯一 `username`。
+
+### 规则
+
+| 项 | 说明 |
+| :--- | :--- |
+| 格式 | 小写 `a-z0-9._-`，2–32 位；空格转 `-`，其它字符丢弃 |
+| 生成 | 创建时可显式指定；不填则由标签派生；纯中文/符号标签回落到 `user-xxxx` |
+| 唯一性 | 全库唯一（含管理员）；显式指定重复 → `409 用户名已被占用` |
+| 解析 | `POST /api/slots` 的 `member` 字段现在**接受用户名或 id**，大小写不敏感 |
+| 改名 | `PATCH /api/users/{id}` 支持 `{username}`，改名后旧名立即失效 |
+| 老数据 | 启动时自动补齐（`migrateUsernames`），无需手工处理 |
+
+### 界面
+
+下发表单从下拉框换成**输入框 + datalist**：
+
+```
+接收人（用户名）  [ b1            ]      ← 可直接输用户名
+                  → B1-家宽（b1）        ← 实时显示会发给谁
+```
+
+用户名叫不准时打名字也能匹配（`张三` → 命中后显示其 username）；已吊销的接收人不在候选里，手输会提示不能下发。
+
+### 命令行
+
+```sh
+authclip -dir ./data add member "B1-家宽" b1      # 第 3 个参数是用户名
+authclip -dir ./data users                        # 显示 角色/范围/用户名/id/标签/吊销
+```
+
+### 测试（共 22 个）
+
+```
+PASS TestUsernameUniquenessAndLookup   重名 409、按用户名下发、未知用户名 400、改名后旧名失效
+PASS TestUsernameBackfilledForLegacyData 老数据自动补齐（Legacy User → legacy-user）
+```

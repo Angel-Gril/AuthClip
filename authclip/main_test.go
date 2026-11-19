@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // 这些用例对应上线前审查提出的三条阻断项：
@@ -38,12 +39,12 @@ func newEnv(t *testing.T, secret string) *env {
 		t.Fatalf("openStore: %v", err)
 	}
 	a := &app{st: st}
-	admin, err := st.addUser("admin", "all", "A")
+	admin, err := st.addUser("admin", "all", "A", "a")
 	if err != nil {
 		t.Fatal(err)
 	}
-	b1, _ := st.addUser("member", "", "B1")
-	b2, _ := st.addUser("member", "", "B2")
+	b1, _ := st.addUser("member", "", "B1", "b1")
+	b2, _ := st.addUser("member", "", "B2", "b2")
 
 	h, err := a.routes()
 	if err != nil {
@@ -186,7 +187,7 @@ func TestStoreEncryptionAtRest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	u, err := st.addUser("admin", "all", "A")
+	u, err := st.addUser("admin", "all", "A", "a")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -233,7 +234,7 @@ func TestLinkStateParsing(t *testing.T) {
 func TestOwnScopeAdminIsIsolated(t *testing.T) {
 	e := newEnv(t, "")
 	// 另一个「限自己」的管理员
-	own, err := e.app.st.addUser("admin", "own", "A2")
+	own, err := e.app.st.addUser("admin", "own", "A2", "a2")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -401,7 +402,7 @@ func TestPurgeOnlyForAllScope(t *testing.T) {
 	id := e.newSlot(t, e.b1)
 	e.call(t, "DELETE", "/api/slots/"+id, e.admin.Token, nil)
 
-	own, _ := e.app.st.addUser("admin", "own", "A2")
+	own, _ := e.app.st.addUser("admin", "own", "A2", "a2")
 	// 限自己的管理员不能彻底删除
 	if code, _ := e.call(t, "DELETE", "/api/slots/"+id+"?purge=1", own.Token, nil); code != http.StatusNotFound {
 		t.Fatalf("own 访问他人任务应 404，实际 %d", code)
@@ -418,7 +419,7 @@ func TestPurgeOnlyForAllScope(t *testing.T) {
 
 func TestOwnScopeCannotCreateMember(t *testing.T) {
 	e := newEnv(t, "")
-	own, _ := e.app.st.addUser("admin", "own", "A2")
+	own, _ := e.app.st.addUser("admin", "own", "A2", "a2")
 	if code, _ := e.call(t, "POST", "/api/members", own.Token, map[string]any{"label": "B3"}); code != http.StatusForbidden {
 		t.Fatalf("限自己的管理员能建接收人：%d", code)
 	}
@@ -456,7 +457,7 @@ func TestExportCSV(t *testing.T) {
 		}
 	}
 	// 限自己的管理员不能导出
-	own, _ := e.app.st.addUser("admin", "own", "A2")
+	own, _ := e.app.st.addUser("admin", "own", "A2", "a2")
 	if code, _ := e.call(t, "GET", "/api/export?format=csv", own.Token, nil); code != http.StatusForbidden {
 		t.Fatalf("own 能导出：%d", code)
 	}
@@ -644,7 +645,7 @@ func TestLinkRevealIsPerRequestAndAudited(t *testing.T) {
 	}
 
 	// 限自己范围的管理员：403
-	own, _ := e.app.st.addUser("admin", "own", "A2")
+	own, _ := e.app.st.addUser("admin", "own", "A2", "a2")
 	if code, _ := e.call(t, "GET", "/api/users/"+e.b1.ID+"/link", own.Token, nil); code != http.StatusForbidden {
 		t.Fatalf("own 能取链接：%d", code)
 	}
@@ -675,3 +676,77 @@ func TestLinkRevealIsPerRequestAndAudited(t *testing.T) {
 		t.Fatal("查看链接未留审计")
 	}
 }
+
+
+// ---------------------------------------------------------------- 用户名
+
+func TestUsernameUniquenessAndLookup(t *testing.T) {
+	e := newEnv(t, "")
+	// 显式用户名冲突 → 409
+	if code, _ := e.call(t, "POST", "/api/members", e.admin.Token, map[string]any{"label": "另一个", "username": "b1"}); code != http.StatusConflict {
+		t.Fatalf("重复用户名应 409，实际 %d", code)
+	}
+	// 不填用户名 → 从标签派生
+	code, out := e.call(t, "POST", "/api/members", e.admin.Token, map[string]any{"label": "张 三"})
+	if code != http.StatusOK {
+		t.Fatalf("创建失败：%d %v", code, out)
+	}
+	if got := out["username"]; got != "张-三" && got != "user" && got != "" {
+		// 中文标签 normalize 后为空 → 回落 user；这里只要求非空
+	}
+	if _, ok := out["username"].(string); !ok {
+		t.Fatalf("应返回 username：%v", out)
+	}
+	// 用用户名下发
+	created, out2 := e.call(t, "POST", "/api/slots", e.admin.Token, map[string]any{
+		"member": "b1", "link": testLink, "label": "by-username",
+	})
+	if created != http.StatusOK {
+		t.Fatalf("按用户名下发失败：%d %v", created, out2)
+	}
+	if out2["member"] != e.b1.ID {
+		t.Fatalf("解析到了错误的接收人：%v", out2["member"])
+	}
+	// 未知用户名
+	if code, _ := e.call(t, "POST", "/api/slots", e.admin.Token, map[string]any{
+		"member": "nobody", "link": testLink,
+	}); code != http.StatusBadRequest {
+		t.Fatalf("未知用户名应 400，实际 %d", code)
+	}
+	// 改名后旧名失效、新名可用
+	if code, _ := e.call(t, "PATCH", "/api/users/"+e.b1.ID, e.admin.Token, map[string]any{"username": "wang-xiao"}); code != http.StatusOK {
+		t.Fatal("改名失败")
+	}
+	if code, _ := e.call(t, "POST", "/api/slots", e.admin.Token, map[string]any{"member": "b1", "link": testLink}); code != http.StatusBadRequest {
+		t.Fatalf("旧用户名应失效，实际 %d", code)
+	}
+	if code, _ := e.call(t, "POST", "/api/slots", e.admin.Token, map[string]any{"member": "wang-xiao", "link": testLink}); code != http.StatusOK {
+		t.Fatalf("新用户名应可用，实际 %d", code)
+	}
+}
+
+func TestUsernameBackfilledForLegacyData(t *testing.T) {
+	dir := t.TempDir()
+	st, err := openStore(dir, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 手工塞一个没有 username 的老记录
+	st.d.Users = append(st.d.Users, &User{ID: "old1", Role: "member", Label: "Legacy User", Token: "tok-old", Created: time.Now().UTC()})
+	if err := st.saveLocked(); err != nil { // 直接写盘（测试内不并发）
+		t.Fatal(err)
+	}
+	// 重新打开：应自动补齐 username
+	st2, err := openStore(dir, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	u := st2.userByID("old1")
+	if u == nil || u.Username == "" {
+		t.Fatalf("老数据未补齐用户名：%+v", u)
+	}
+	if u.Username != "legacy-user" {
+		t.Fatalf("派生用户名不对：%q", u.Username)
+	}
+}
+

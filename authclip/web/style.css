@@ -154,3 +154,5 @@ button[disabled] { opacity: .45; cursor: default; }
 
 @media (max-width: 560px) { .guide { display: none; } }
 
+.warn-text { color: var(--warn) !important; }
+

@@ -213,20 +213,42 @@ function stateOfLink(link) {
 
 function newSlotForm() {
   const members = state.board.members || [];
-  const select = el("select", { id: "member" },
-    el("option", { value: "", text: members.length ? "选择接收人" : "先添加接收人" }),
-    members.map((m) => el("option", { value: m.id, text: `${m.label} · ${m.id.slice(0, 4)}` })),
+  // 按用户名选：输入框 + datalist，输入用户名或名字都能匹配；服务端按用户名解析
+  const pick = el("input", {
+    id: "member", list: "member-list", autocomplete: "off", spellcheck: "false",
+    placeholder: members.length ? "输入用户名，如 b01" : "先添加接收人",
+  });
+  const list = el("datalist", { id: "member-list" },
+    members.filter((m) => !m.revoked).map((m) =>
+      el("option", { value: m.username, label: `${m.label}（${m.username}）` })),
   );
+  const resolved = el("p", { class: "hint" });
+  const sync = () => {
+    const v = pick.value.trim().toLowerCase();
+    const hit = members.find((m) => m.username === v || m.id === v ||
+      String(m.label).toLowerCase() === v);
+    resolved.textContent = !v ? "" : hit
+      ? (hit.revoked ? `⚠「${hit.label}」已吊销，不能下发` : `→ ${hit.label}（${hit.username}）`)
+      : "⚠ 没有匹配的接收人";
+    resolved.className = `hint ${v && !hit ? "warn-text" : ""}`;
+  };
+  pick.addEventListener("input", sync);
+
   const link = el("textarea", { id: "new-link", class: "tall", spellcheck: "false", placeholder: "粘贴 Claude 授权链接（原样保存，不会尝试访问）" });
   const label = el("input", { id: "new-label", maxlength: 60, placeholder: "备注，例如 家宽-日本" });
 
   const submit = async (event) => {
     event.preventDefault();
     if (state.busy) return;
+    const v = pick.value.trim();
+    const hit = members.find((m) => m.username === v.toLowerCase() || m.id === v ||
+      String(m.label).toLowerCase() === v.toLowerCase());
+    if (!hit) return flash("请填写接收人用户名", "err");
+    if (hit.revoked) return flash("该接收人已吊销", "err");
     state.busy = true;
     try {
       await api("/api/slots", {
-        body: { member: select.value, link: link.value, label: label.value },
+        body: { member: hit.id, link: link.value, label: label.value },
       });
       flash("已下发；对方打开自己的长期链接就能看到");
       await refresh();
@@ -240,13 +262,13 @@ function newSlotForm() {
   return el("form", { class: "card stack", onsubmit: submit },
     el("h2", { text: "下发授权链接" }),
     el("div", { class: "row" },
-      el("div", { class: "grow" }, el("label", {}, "接收人", select)),
+      el("div", { class: "grow" }, el("label", {}, "接收人（用户名）", pick, list, resolved)),
       el("div", { class: "grow" }, el("label", {}, "备注", label)),
     ),
     el("label", {}, "授权链接", link),
     feedbackLine(),
     el("div", { class: "row" }, el("button", { class: "primary", type: "submit", text: "下发", disabled: state.busy })),
-    el("p", { class: "hint", text: "服务端只保存字符串：不预取、不校验可达性、不发往任何第三方。" }),
+    el("p", { class: "hint", text: "用户名叫不准时可直接输名字，下方会显示匹配到谁。服务端只保存链接字符串：不预取、不校验可达性。" }),
   );
 }
 
@@ -257,12 +279,13 @@ function maskLink(link) {
 
 function memberPanel() {
   const input = el("input", { id: "new-member", maxlength: 40, placeholder: "新接收人名字" });
+  const uname = el("input", { id: "new-member-username", maxlength: 32, autocomplete: "off", placeholder: "用户名（选填，如 b03）" });
   const add = async (event) => {
     event.preventDefault();
     if (state.busy) return;
     state.busy = true;
     try {
-      const m = await api("/api/members", { body: { label: input.value } });
+      const m = await api("/api/members", { body: { label: input.value, username: uname.value } });
       flash(`已创建「${m.label}」，长期链接已可复制`);
       await refresh();
     } catch (e) {
@@ -275,6 +298,7 @@ function memberPanel() {
     // 长期链接不再随列表下发（防批量泄露）：要发就重新签发一条，只显示一次
     return el("div", { class: "member-row" },
       el("span", { class: "name", text: m.label }),
+      mono(m.username || ""),
       m.revoked ? el("span", { class: "badge warn", text: "已吊销" }) : null,
       mono("链接不在列表中显示"),
       el("span", { class: "grow" }),
@@ -305,6 +329,7 @@ function memberPanel() {
     el("div", { class: "members" }, list.length ? list : el("p", { class: "hint", text: "还没有接收人。" })),
     el("form", { class: "row", onsubmit: add },
       el("div", { class: "grow" }, el("label", {}, "新增接收人", input)),
+      el("div", { class: "grow" }, el("label", {}, "用户名", uname)),
       el("button", { class: "primary", type: "submit", text: "创建并生成链接", disabled: state.busy }),
     ),
     el("p", { class: "hint", text: "这条链接长期有效、无需登录：转发即等于授权，务必只给对应的人。" }),
@@ -330,6 +355,7 @@ function usersPanel() {
     const role = u.role === "admin" ? (u.scope === "own" ? "管理员·限自己" : "管理员·全量") : "接收人";
     return el("div", { class: "member-row" },
       el("span", { class: "name", text: u.label || "未命名" }),
+      mono(u.username || ""),
       el("span", { class: "chip", text: role }),
       u.revoked ? el("span", { class: "badge warn", text: "已吊销" }) : el("span", { class: "badge filled", text: "有效" }),
       u.self ? el("span", { class: "badge", text: "当前账号" }) : null,
@@ -375,13 +401,17 @@ function usersPanel() {
   toggleScope();
 
   const labelInput = el("input", { maxlength: 40, placeholder: "名字" });
+  const unameInput = el("input", { maxlength: 32, autocomplete: "off", placeholder: "用户名（选填）" });
   const create = async (event) => {
     event.preventDefault();
     if (state.busy) return;
     state.busy = true;
     try {
       const r = await api("/api/users", {
-        body: { role: roleSel.value, scope: scopeSel.value, label: labelInput.value },
+        body: {
+          role: roleSel.value, scope: scopeSel.value,
+          label: labelInput.value, username: unameInput.value,
+        },
       });
       await copy(r.link, "已创建，长期链接已复制（只显示这一次）");
       await refresh();
@@ -399,6 +429,7 @@ function usersPanel() {
       el("div", { class: "grow" }, el("label", {}, "角色", roleSel)),
       scopeWrap,
       el("div", { class: "grow" }, el("label", {}, "名字", labelInput)),
+      el("div", { class: "grow" }, el("label", {}, "用户名", unameInput)),
       el("button", { class: "primary", type: "submit", text: "创建", disabled: state.busy }),
     ),
     el("p", { class: "hint", text: "「限自己」的管理员只能看/管自己下发的任务，也拿不到接收人的长期链接；轮换与吊销会立即让对方当前链接失效。" }),
@@ -1002,6 +1033,8 @@ window.addEventListener("focus", () => {
 });
 
 void start();
+
+
 
 
 

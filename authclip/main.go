@@ -55,19 +55,20 @@ const (
 	maxBody    = 128 << 10
 	maxLink    = 8192
 	sessionEC  = 20 * time.Second
-	appVersion = "v1.3.2" // v1.3.1: 令牌不外泄/state 强制/导出脱敏｜v1.3.2: 单条取链接+审计
+	appVersion = "v1.4.0" // v1.3.x 安全修复｜v1.4.0: 唯一用户名 + 按用户名下发
 )
 
 // ---------------------------------------------------------------- 模型
 
 type User struct {
-	ID      string    `json:"id"`
-	Role    string    `json:"role"`  // admin | member
-	Scope   string    `json:"scope"` // admin: all | own；member 忽略
-	Label   string    `json:"label"`
-	Token   string    `json:"token"`
-	Revoked bool      `json:"revoked"`
-	Created time.Time `json:"created"`
+	ID       string    `json:"id"`
+	Username string    `json:"username"` // 唯一，用于下发给谁
+	Role     string    `json:"role"`     // admin | member
+	Scope    string    `json:"scope"`    // admin: all | own；member 忽略
+	Label    string    `json:"label"`
+	Token    string    `json:"token"`
+	Revoked  bool      `json:"revoked"`
+	Created  time.Time `json:"created"`
 }
 
 // scopeOf：空值按 all 处理（兼容 v1.1 之前建的管理员）
@@ -167,6 +168,7 @@ func openStore(dir, secret string) (*store, error) {
 		if err := json.Unmarshal(raw, &s.d); err != nil {
 			return nil, fmt.Errorf("解析 %s: %w", s.path, err)
 		}
+		s.migrateUsernames()
 		return s, nil
 	}
 	if !errors.Is(err, os.ErrNotExist) {
@@ -179,6 +181,7 @@ func openStore(dir, secret string) (*store, error) {
 			if err := json.Unmarshal(old, &s.d); err != nil {
 				return nil, fmt.Errorf("解析 %s: %w", plain, err)
 			}
+			s.migrateUsernames()
 			s.mu.Lock()
 			saveErr := s.saveLocked()
 			s.mu.Unlock()
@@ -280,10 +283,69 @@ func newToken() string {
 	return strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(b))
 }
 
-func (s *store) addUser(role, scope, label string) (*User, error) {
+// normalizeUsername：小写、只留 a-z0-9._-，空格转 -
+func normalizeUsername(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '.', r == '_', r == '-':
+			b.WriteRune(r)
+		case r == ' ' || r == '\t':
+			b.WriteRune('-')
+		}
+	}
+	out := strings.Trim(b.String(), "-._")
+	if len(out) > 32 {
+		out = out[:32]
+	}
+	return out
+}
+
+// uniqueUsernameLocked 在锁内生成不冲突的用户名
+func (s *store) uniqueUsernameLocked(base string) string {
+	if base == "" {
+		base = "user"
+	}
+	taken := func(name string) bool {
+		for _, u := range s.d.Users {
+			if strings.EqualFold(u.Username, name) {
+				return true
+			}
+		}
+		return false
+	}
+	if !taken(base) {
+		return base
+	}
+	for i := 2; i < 1000; i++ {
+		cand := fmt.Sprintf("%s-%d", base, i)
+		if !taken(cand) {
+			return cand
+		}
+	}
+	return base + "-" + newToken()[:4]
+}
+
+func (s *store) addUser(role, scope, label, username string) (*User, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	u := &User{ID: newToken()[:10], Role: role, Scope: scope, Label: label, Token: newToken(), Created: time.Now().UTC()}
+	want := normalizeUsername(username)
+	if want == "" {
+		want = normalizeUsername(label)
+	}
+	if want == "" {
+		want = "user-" + newToken()[:4] // 纯中文/符号标签：给一个可辨识的默认名
+	}
+	final := s.uniqueUsernameLocked(want)
+	// 显式指定了用户名但已被占用：直接报错，不静默改名
+	if username != "" && normalizeUsername(username) != final {
+		return nil, errUsernameTaken
+	}
+	u := &User{
+		ID: newToken()[:10], Username: final, Role: role, Scope: scope,
+		Label: label, Token: newToken(), Created: time.Now().UTC(),
+	}
 	if role != "admin" {
 		u.Scope = ""
 	}
@@ -295,6 +357,49 @@ func (s *store) addUser(role, scope, label string) (*User, error) {
 	cp := *u
 	s.notifyLocked("admin")
 	return &cp, nil
+}
+
+var errUsernameTaken = errors.New("用户名已被占用")
+
+// migrateUsernames：老数据没有 username，启动时补齐
+func (s *store) migrateUsernames() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	changed := false
+	for _, u := range s.d.Users {
+		if u.Username != "" {
+			continue
+		}
+		base := normalizeUsername(u.Label)
+		if base == "" {
+			base = normalizeUsername(u.Role)
+		}
+		if base == "" {
+			base = "user"
+		}
+		u.Username = s.uniqueUsernameLocked(base)
+		changed = true
+	}
+	if changed {
+		_ = s.saveLocked()
+	}
+}
+
+// userByUsername：按用户名解析（大小写不敏感）
+func (s *store) userByUsername(name string) *User {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, u := range s.d.Users {
+		if strings.EqualFold(u.Username, name) || u.ID == name {
+			cp := *u
+			return &cp
+		}
+	}
+	return nil
 }
 
 func (s *store) updateUser(id string, fn func(*User) error) (*User, error) {
@@ -719,7 +824,7 @@ func (a *app) cli(args []string) {
 			if u.Revoked {
 				state = "  [已吊销]"
 			}
-			fmt.Printf("%-6s %-4s %-10s %s%s\n", u.Role, u.scopeOf(), u.ID, u.Label, state)
+			fmt.Printf("%-6s %-4s %-12s %-16s %s%s\n", u.Role, u.scopeOf(), u.Username, u.ID, u.Label, state)
 		}
 	case "add":
 		if len(args) < 3 || (args[1] != "admin" && args[1] != "member") {
@@ -738,7 +843,12 @@ func (a *app) cli(args []string) {
 		if args[1] == "admin" && scope == "" {
 			scope = "all"
 		}
-		u, err := a.st.addUser(args[1], scope, strings.Join(labelParts, " "))
+		uname := ""
+		if args[1] == "member" && len(labelParts) > 1 {
+			uname = labelParts[len(labelParts)-1]
+			labelParts = labelParts[:len(labelParts)-1]
+		}
+		u, err := a.st.addUser(args[1], scope, strings.Join(labelParts, " "), uname)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -836,7 +946,7 @@ func (a *app) config(w http.ResponseWriter, r *http.Request) {
 
 func (a *app) me(w http.ResponseWriter, r *http.Request, u *User) {
 	writeJSON(w, http.StatusOK, map[string]string{
-		"id": u.ID, "role": u.Role, "label": u.Label, "scope": u.scopeOf(),
+		"id": u.ID, "username": u.Username, "role": u.Role, "label": u.Label, "scope": u.scopeOf(),
 	})
 }
 
@@ -854,7 +964,8 @@ func (a *app) board(w http.ResponseWriter, r *http.Request, u *User) {
 		// 长期链接不再随看板下发：需要时用 rotate 重新签发（一次性显示），
 		// 避免任何列表接口成为令牌批量出口。
 		members = append(members, map[string]any{
-			"id": m.ID, "label": m.Label, "revoked": m.Revoked, "created": m.Created,
+			"id": m.ID, "username": m.Username, "label": m.Label,
+			"revoked": m.Revoked, "created": m.Created,
 		})
 	}
 
@@ -874,8 +985,8 @@ func (a *app) board(w http.ResponseWriter, r *http.Request, u *User) {
 		users := []map[string]any{}
 		for _, x := range a.st.users() {
 			users = append(users, map[string]any{
-				"id": x.ID, "role": x.Role, "scope": x.scopeOf(), "label": x.Label,
-				"revoked": x.Revoked, "created": x.Created, "self": x.ID == u.ID,
+				"id": x.ID, "username": x.Username, "role": x.Role, "scope": x.scopeOf(),
+				"label": x.Label, "revoked": x.Revoked, "created": x.Created, "self": x.ID == u.ID,
 			})
 		}
 		resp["users"] = users
@@ -910,7 +1021,8 @@ func (a *app) addMember(w http.ResponseWriter, r *http.Request, u *User) {
 		return
 	}
 	var body struct {
-		Label string `json:"label"`
+		Label    string `json:"label"`
+		Username string `json:"username"`
 	}
 	if err := decode(w, r, &body); err != nil {
 		return
@@ -922,15 +1034,19 @@ func (a *app) addMember(w http.ResponseWriter, r *http.Request, u *User) {
 	if len(label) > 40 {
 		label = label[:40]
 	}
-	m, err := a.st.addUser("member", "", label)
+	m, err := a.st.addUser("member", "", label, body.Username)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "写入失败"})
+		if errors.Is(err, errUsernameTaken) {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "用户名已被占用"})
+		} else {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "写入失败"})
+		}
 		return
 	}
 	a.st.appendAudit(&Audit{Actor: u.ID, Label: u.Label, Action: "user.create", Target: m.ID + ":" + m.Label})
 	// 链接只在创建这一次完整返回；own 范围管理员后续无法再取到
 	writeJSON(w, http.StatusOK, map[string]any{
-		"id": m.ID, "label": m.Label, "token": m.Token, "link": a.linkFor(m),
+		"id": m.ID, "username": m.Username, "label": m.Label, "token": m.Token, "link": a.linkFor(m),
 	})
 }
 
@@ -945,8 +1061,8 @@ func (a *app) listUsers(w http.ResponseWriter, r *http.Request, u *User) {
 	out := make([]map[string]any, 0)
 	for _, x := range a.st.users() {
 		out = append(out, map[string]any{
-			"id": x.ID, "role": x.Role, "scope": x.scopeOf(), "label": x.Label,
-			"revoked": x.Revoked, "created": x.Created,
+			"id": x.ID, "username": x.Username, "role": x.Role, "scope": x.scopeOf(),
+			"label": x.Label, "revoked": x.Revoked, "created": x.Created,
 		})
 	}
 	writeJSON(w, http.StatusOK, out)
@@ -974,7 +1090,7 @@ func (a *app) userLink(w http.ResponseWriter, r *http.Request, u *User) {
 		Target: target.ID + ":" + target.Label,
 	})
 	writeJSON(w, http.StatusOK, map[string]string{
-		"id": target.ID, "label": target.Label, "role": target.Role,
+		"id": target.ID, "username": target.Username, "label": target.Label, "role": target.Role,
 		"link": a.linkFor(target),
 	})
 }
@@ -985,9 +1101,10 @@ func (a *app) createUser(w http.ResponseWriter, r *http.Request, u *User) {
 		return
 	}
 	var body struct {
-		Role  string `json:"role"`
-		Scope string `json:"scope"`
-		Label string `json:"label"`
+		Role     string `json:"role"`
+		Scope    string `json:"scope"`
+		Label    string `json:"label"`
+		Username string `json:"username"`
 	}
 	if err := decode(w, r, &body); err != nil {
 		return
@@ -1008,15 +1125,19 @@ func (a *app) createUser(w http.ResponseWriter, r *http.Request, u *User) {
 	if len(label) > 40 {
 		label = label[:40]
 	}
-	nu, err := a.st.addUser(role, scope, label)
+	nu, err := a.st.addUser(role, scope, label, body.Username)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "写入失败"})
+		if errors.Is(err, errUsernameTaken) {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "用户名已被占用"})
+		} else {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "写入失败"})
+		}
 		return
 	}
 	a.st.appendAudit(&Audit{Actor: u.ID, Label: u.Label, Action: "user.create", Target: nu.ID + ":" + nu.Label})
 	writeJSON(w, http.StatusOK, map[string]any{
-		"id": nu.ID, "role": nu.Role, "scope": nu.scopeOf(), "label": nu.Label,
-		"link": a.linkFor(nu), "token": nu.Token,
+		"id": nu.ID, "username": nu.Username, "role": nu.Role, "scope": nu.scopeOf(),
+		"label": nu.Label, "link": a.linkFor(nu), "token": nu.Token,
 	})
 }
 
@@ -1026,9 +1147,10 @@ func (a *app) patchUser(w http.ResponseWriter, r *http.Request, u *User) {
 		return
 	}
 	var body struct {
-		Label  *string `json:"label"`
-		Scope  *string `json:"scope"`
-		Revoke *bool   `json:"revoke"`
+		Label    *string `json:"label"`
+		Username *string `json:"username"`
+		Scope    *string `json:"scope"`
+		Revoke   *bool   `json:"revoke"`
 	}
 	if err := decode(w, r, &body); err != nil {
 		return
@@ -1054,6 +1176,18 @@ func (a *app) patchUser(w http.ResponseWriter, r *http.Request, u *User) {
 				v = v[:40]
 			}
 			x.Label = v
+		}
+		if body.Username != nil {
+			want := normalizeUsername(*body.Username)
+			if len(want) < 2 {
+				return errUsernameTaken
+			}
+			for _, other := range a.st.d.Users {
+				if other.ID != x.ID && strings.EqualFold(other.Username, want) {
+					return errUsernameTaken
+				}
+			}
+			x.Username = want
 		}
 		if body.Scope != nil {
 			if strings.TrimSpace(*body.Scope) == "own" {
@@ -1107,7 +1241,8 @@ func (a *app) rotateUser(w http.ResponseWriter, r *http.Request, u *User) {
 	fresh = upd
 	a.st.appendAudit(&Audit{Actor: u.ID, Label: u.Label, Action: "user.rotate", Target: id + ":" + upd.Label})
 	writeJSON(w, http.StatusOK, map[string]any{
-		"id": fresh.ID, "label": fresh.Label, "link": a.linkFor(fresh), "token": fresh.Token,
+		"id": fresh.ID, "username": fresh.Username, "label": fresh.Label,
+		"link": a.linkFor(fresh), "token": fresh.Token,
 	})
 }
 
@@ -1297,9 +1432,9 @@ func (a *app) createSlot(w http.ResponseWriter, r *http.Request, u *User) {
 	if err := decode(w, r, &body); err != nil {
 		return
 	}
-	m := a.st.userByID(strings.TrimSpace(body.Member))
+	m := a.st.userByUsername(strings.TrimSpace(body.Member))
 	if m == nil || m.Role != "member" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "接收人不存在"})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "接收人不存在（请检查用户名）"})
 		return
 	}
 	link := strings.TrimSpace(body.Link)
@@ -1360,9 +1495,9 @@ func (a *app) patchSlot(w http.ResponseWriter, r *http.Request, u *User) {
 		}
 	}
 	if body.Member != nil {
-		m := a.st.userByID(strings.TrimSpace(*body.Member))
+		m := a.st.userByUsername(strings.TrimSpace(*body.Member))
 		if m == nil || m.Role != "member" {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "接收人不存在"})
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "接收人不存在（请检查用户名）"})
 			return
 		}
 	}
@@ -1836,6 +1971,13 @@ func plausibleURL(s string) bool {
 	}
 	return host != "" && !strings.ContainsAny(host, " \t\r\n")
 }
+
+
+
+
+
+
+
 
 
 
