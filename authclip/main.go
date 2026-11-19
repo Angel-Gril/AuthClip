@@ -55,7 +55,7 @@ const (
 	maxBody    = 128 << 10
 	maxLink    = 8192
 	sessionEC  = 20 * time.Second
-	appVersion = "v1.5.0" // v1.4.x 修复｜v1.5.0: 前端「授权轮次」收敛为单一状态对象
+	appVersion = "v1.5.1" // v1.5.0: 轮次对象收敛｜v1.5.1: 剪贴板 await 期间换链不再写回
 )
 
 // ---------------------------------------------------------------- 模型
@@ -2087,6 +2087,7 @@ func plausibleURL(s string) bool {
 	}
 	return host != "" && !strings.ContainsAny(host, " \t\r\n")
 }
+
 
 
 

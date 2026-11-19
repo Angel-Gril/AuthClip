@@ -174,10 +174,14 @@ function roundFor(slot) {
   return fresh;
 }
 
-function patchRound(id, patch) {
+// expectGen：写入方在「读」之前看到的代次。异步路径必须传：
+// 否则 await 期间换链、round 被删又重建之后，旧数据会写进新轮次。
+function patchRound(id, patch, expectGen) {
   const cur = state.rounds.get(id);
-  if (!cur) return;
+  if (!cur) return false;
+  if (expectGen !== undefined && cur.gen !== expectGen) return false;
   state.rounds.set(id, { ...cur, ...patch });
+  return true;
 }
 
 function dropStaleRounds() {
@@ -827,11 +831,22 @@ async function tryAutoPaste() {
     return r && r.opened && r.gen === (s.link_gen ?? 0);
   });
   if (!target) return;
+  const expectGen = target.link_gen ?? 0; // 「读剪贴板」之前看到的代次
   try {
     const text = await navigator.clipboard.readText();
     const p = parseCallback(text);
     if (!p?.code) return;
-    patchRound(target.id, { callback: text, opened: false });
+    // await 期间可能换链：再确认任务仍是同一代次
+    const live = (state.mine.slots || []).find((s) => s.id === target.id);
+    if (!live || (live.link_gen ?? 0) !== expectGen) {
+      flash("授权链接已更新，剪贴板内容未填入，请重新打开授权链接。", "err");
+      return;
+    }
+    // 写入时再按代次兜一次（round 可能已被重建）
+    if (!patchRound(target.id, { callback: text, opened: false }, expectGen)) {
+      flash("授权轮次已变化，剪贴板内容未填入。", "err");
+      return;
+    }
     flash("已从剪贴板自动填入 code，核对后提交");
   } catch { /* 没有剪贴板权限：留给按钮 */ }
 }
@@ -897,11 +912,17 @@ function memberCard(slot) {
   callback.addEventListener("paste", () => setTimeout(handlePaste, 0));
 
   const readClip = async () => {
+    const expectGen = round.gen; // 点击那一刻的代次
     try {
       const text = await navigator.clipboard.readText();
-      callback.value = text;
-      set({ callback: text });
       const p = parseCallback(text);
+      // await 期间可能换链：代次不符就不写，避免旧剪贴板进新轮次
+      if (!patchRound(slot.id, { callback: text }, expectGen)) {
+        flash("授权链接已更新，剪贴板内容未填入，请重新打开授权链接。", "err");
+        render();
+        return;
+      }
+      callback.value = text;
       flash(p?.code ? "已从剪贴板取到 code" : "剪贴板里没有 code=", p?.code ? "ok" : "err");
       render();
     } catch {
@@ -1129,6 +1150,7 @@ window.addEventListener("focus", () => {
 });
 
 void start();
+
 
 
 

@@ -722,3 +722,46 @@ B 也点开后 A 端换链（gen 1->2，state 不变）
 ```
 
 顺带解决了旧实现的另一个缺陷：`pendingSlot` 只能记住**一个**任务，同时开两条任务时自动填入会串；现在每个任务各有一份 round。
+
+## 二十五、v1.5.1：剪贴板读取期间换链（TOCTOU）
+
+### 问题
+
+v1.5.0 收敛成 round 对象后，写入仍只按**任务 id**：
+
+```js
+const target = live.find(...);                 // ① 此刻 gen=1
+const text = await navigator.clipboard.readText();   // ② 这里可能换链
+patchRound(target.id, { callback: text });     // ③ 只按 id 写
+```
+
+如果 ② 期间收到换链：`dropStaleRounds()` 删掉旧 round → `render()` 立刻用**新 gen** 重建一份空 round（`roundFor` 的副作用）→ ③ 正好写进这份新 round。于是剪贴板里的旧回调挂到新轮次上；新旧链接若共用同一个 `state`，服务端也拦不住。
+
+### 修复
+
+`patchRound(id, patch, expectGen)`：写入方必须带上"读之前看到的代次"，不符则拒写并返回 `false`。
+异步路径（自动填入、手动「读剪贴板并解析」）全部改成：
+
+```js
+const expectGen = target.link_gen;
+const text = await navigator.clipboard.readText();
+const live = state.mine.slots.find(s => s.id === target.id);
+if (!live || live.link_gen !== expectGen) { 提示"链接已更新，未填入"; return; }
+if (!patchRound(target.id, {...}, expectGen)) { 提示"轮次已变化，未填入"; return; }
+```
+
+即 **await 前后各校验一次**，写入本身也带条件。
+
+### 实测（浏览器内，用延迟 900ms 的剪贴板桩制造窗口）
+
+```
+点开授权链接（gen=1）→ focus → 进入 readText 的 await
+在窗口内 A 端换链（gen 1->2，state 仍 SAME）
+剪贴板 promise 落地后：
+  textarea = ""            ← 未写入
+  RACE_STALE 未出现         ← 旧回调没有进入表单
+  提示：授权链接已更新，之前的草稿已清空…
+
+正常路径（不换链）：
+  自动填入 FRESH_OK 正常    ← 功能没被削弱
+```
