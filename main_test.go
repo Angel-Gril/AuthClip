@@ -401,8 +401,12 @@ func TestArchiveKeepsMemberHistory(t *testing.T) {
 		t.Fatalf("B 的历史应有 1 条，实际 %d", len(slots))
 	}
 	s := slots[0].(map[string]any)
-	if s["deleted"] != true || s["code"] != "ARCH1" {
-		t.Fatalf("历史内容不对：%v", s)
+	// v1.7.3：B 端提交后内容一律不下发，历史里只剩状态与打码邮箱
+	if s["deleted"] != true || s["email"] != "b1***@example.com" {
+		t.Fatalf("历史摘要不对：%v", s)
+	}
+	if _, leaked := s["code"]; leaked {
+		t.Fatalf("历史里不该再出现 code：%v", s)
 	}
 	// 归档后不能再回传
 	if code, _ := e.report(t, e.b1.Token, id, map[string]any{"email": "b1@example.com", "callback": cb}); code == http.StatusOK {
@@ -1199,5 +1203,29 @@ func TestPasswordReportAndMasking(t *testing.T) {
 	e.call(t, "POST", "/api/slots/"+id+"/clear", e.admin.Token, map[string]any{})
 	if s := e.app.st.slotByID(id); s.Password != "" {
 		t.Fatalf("清空后密码残留: %q", s.Password)
+	}
+}
+
+// v1.7.3：B 端提交成功后，接口不再下发 code/密码/回调/IP
+func TestMemberCannotReadBackOwnCredentials(t *testing.T) {
+	e := newEnv(t, "")
+	id := e.newSlot(t, e.b1)
+	if code, _ := e.report(t, e.b1.Token, id, map[string]any{
+		"email": "b1@example.com", "password": "MYPASS1",
+		"callback": "http://localhost:54545/callback?code=SECRET-CODE&state=STATE-ONE",
+		"reg_ip":   "9.9.9.9",
+	}); code != http.StatusOK {
+		t.Fatalf("report: %d", code)
+	}
+	_, mine := e.call(t, "GET", "/api/mine", e.b1.Token, nil)
+	raw, _ := json.Marshal(mine)
+	for _, secret := range []string{"SECRET-CODE", "MYPASS1", "9.9.9.9", "localhost:54545"} {
+		if strings.Contains(string(raw), secret) {
+			t.Fatalf("B 端接口泄露了 %q：%s", secret, raw)
+		}
+	}
+	s := asSlice(mine["slots"])[0].(map[string]any)
+	if s["submitted"] == nil {
+		t.Fatal("应保留提交时间供 B 端确认")
 	}
 }

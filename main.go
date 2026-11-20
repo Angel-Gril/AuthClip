@@ -57,7 +57,7 @@ const (
 	maxBody    = 128 << 10
 	maxLink    = 8192
 	sessionEC  = 20 * time.Second
-	appVersion = "v1.7.2" // v1.7.1: 密码回传｜v1.7.2: 导出默认明文，打码改为 ?masked=1
+	appVersion = "v1.7.3" // v1.7.2: 导出默认明文｜v1.7.3: B 端提交后不再下发凭证
 )
 
 // ---------------------------------------------------------------- 模型
@@ -1814,9 +1814,22 @@ func (a *app) mine(w http.ResponseWriter, r *http.Request, u *User) {
 		return
 	}
 	ip := a.observed(r) // 仅 member 路径
+	// B 端只拿「够用」的信息：提交成功后凭证类字段一律不下发，
+	// 这样即使抓包/换设备，接收人也拿不到自己交上去的 code 与密码。
+	slots := a.st.slotsFor(u.ID)
+	redacted := make([]map[string]any, 0, len(slots))
+	for _, s := range slots {
+		redacted = append(redacted, map[string]any{
+			"id": s.ID, "label": s.Label, "link": s.Link, "link_gen": s.LinkGen,
+			"submitted": s.Submitted, "deleted": s.Deleted,
+			"email":      maskEmail(s.Email), // 只留打码，便于确认交给过谁
+			"reg_region": s.RegRegion, "seen_region": s.SeenRegion,
+			"created": s.Created, "updated": s.Updated,
+		})
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"role": "member", "label": u.Label,
-		"slots": a.st.slotsFor(u.ID),
+		"slots": redacted,
 		"seen":  map[string]string{"ip": ipText(ip), "region": a.country(ip)},
 	})
 }

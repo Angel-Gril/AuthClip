@@ -38,6 +38,7 @@ const state = {
   // 表单和手动读取剪贴板共用它。
   rounds: new Map(),
   reveal: new Set(),
+  resubmit: new Set(), // B 端点「重新提交」后临时展开表单
   stopStream: null,
 };
 
@@ -229,8 +230,8 @@ function roundFor(slot) {
   const fresh = {
     gen,
     callback: slot.callback || "",
-    email: slot.email || "",
-    password: slot.password || "",
+    email: "",        // 服务端不下发已提交内容，B 端每次都重新填
+    password: "",
     regIp: slot.reg_ip || state.mine.seen?.ip || "",
     regRegion: slot.reg_region || state.mine.seen?.region || "",
     nodeIp: slot.node_ip || "",
@@ -1016,17 +1017,31 @@ function memberCard(slot) {
         },
       });
       state.rounds.delete(slot.id);
-      state.feedback = "已回传，对方会立刻看到；再提交一次可覆盖";
+      state.resubmit.delete(slot.id); // 收起表单，改为只看摘要
+      state.feedback = "已回传，内容已从本页清空；需要修改请点「重新提交」";
       state.feedbackKind = "ok";
       await refresh();
     }, { focus: "report-email" });
     void ok;
   };
 
+  // 提交成功后 B 端只看摘要：凭证不再回显，也不再通过接口下发
+  const submittedSummary = () => el("div", { class: "stack" },
+    el("p", { class: "hint", text: "已提交，本页不再显示内容（避免凭证留在浏览器里）。需要修改请点「重新提交」。" }),
+    el("dl", { class: "facts" },
+      fact("提交时间", timeLabel(slot.submitted)),
+      fact("注册邮箱", slot.email),
+      fact("注册地区", slot.reg_region),
+    ),
+    el("div", { class: "row" },
+      el("button", { type: "button", class: "primary", text: "重新提交", onclick: () => { state.resubmit.add(slot.id); render(); } }),
+    ),
+  );
+
   return el("article", { class: "slot" },
     el("div", { class: "slot-head" },
       el("div", { class: "row" },
-        el("span", { class: `badge ${slot.code ? "filled" : ""}`, text: slot.code ? "已回传" : "待处理" }),
+        el("span", { class: `badge ${slot.submitted ? "filled" : ""}`, text: slot.submitted ? "已回传" : "待处理" }),
         el("span", { class: "slot-label", text: slot.label || "授权任务" }),
         el("span", { class: "slot-id", text: `#${slot.id}` }),
       ),
@@ -1045,8 +1060,8 @@ function memberCard(slot) {
       }),
       el("button", { type: "button", text: "复制链接", onclick: () => copy(slot.link) }),
     ),
-    el("p", { class: "hint", text: "完成后回到对应任务，手动粘贴或点「读剪贴板并解析」。" }),
-    el("form", { class: "stack", onsubmit: submit },
+    slot.submitted ? null : el("p", { class: "hint", text: "完成后回到对应任务，手动粘贴或点「读剪贴板并解析」。" }),
+    (slot.submitted && !state.resubmit.has(slot.id)) ? submittedSummary() : el("form", { class: "stack", onsubmit: submit },
       el("label", {}, "回调链接（粘贴整条，自动提取 code）", callback),
       el("div", { class: "row" },
         el("button", { type: "button", text: "读剪贴板并解析", onclick: readClip }),
@@ -1077,7 +1092,7 @@ function memberCard(slot) {
         el("label", {}, "静态家宽节点 IP（选填）", nodeIp),
       ),
       el("div", { class: "row" },
-        el("button", { class: "primary", type: "submit", text: slot.code ? "更新回传" : "提交回传", disabled: state.busy }),
+        el("button", { class: "primary", type: "submit", text: slot.submitted ? "重新提交" : "提交回传", disabled: state.busy }),
         el("button", { type: "button", text: "用观测值填 IP/地区", onclick: () => {
           const seen = state.mine.seen || {};
           set({ regIp: seen.ip || round.regIp, regRegion: seen.region || round.regRegion });
