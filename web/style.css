@@ -192,3 +192,5 @@ button[disabled] { opacity: .45; cursor: default; }
 
 /* 头部右侧不要裁切（之前 overflow:hidden 会把「实时已连接」切掉） */
 .top-actions { overflow: visible !important; }
+.section-title { font-size: 15px; margin: 4px 0 2px; }
+

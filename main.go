@@ -60,7 +60,7 @@ const (
 	maxBody    = 128 << 10
 	maxLink    = 8192
 	sessionEC  = 20 * time.Second
-	appVersion = "v1.8.6" // v1.8.5: 身份显示｜v1.8.6: 节点字段支持 ip:port:user:pass / socks5 等代理写法
+	appVersion = "v1.8.7" // v1.8.6: 节点支持代理写法｜v1.8.7: 管理端把回填结果提到下发下方
 )
 
 // ---------------------------------------------------------------- 模型

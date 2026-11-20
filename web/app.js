@@ -896,10 +896,15 @@ function adminView() {
     })(),
     feedbackLine(),
     newSlotForm(),
+    // 回填结果紧跟「下发」之后：A 端操作路径是「下发 → 看结果」，
+    // 接收人/权限这些配置项放到后面，不用每次都划过它们。
+    el("div", { class: "stack" },
+      el("h2", { class: "section-title", text: slots.length ? `回填结果（${slots.length}）` : "回填结果" }),
+      slots.length ? el("div", { class: "stack" }, slots.map(adminSlotCard))
+        : el("div", { class: "card" }, el("p", { class: "muted", text: "还没有下发授权链接。" })),
+    ),
     memberPanel(),
     usersPanel(),
-    slots.length ? el("div", { class: "stack" }, slots.map(adminSlotCard))
-      : el("div", { class: "card" }, el("p", { class: "muted", text: "还没有下发授权链接。" })),
     auditPanel(),
   );
 }
