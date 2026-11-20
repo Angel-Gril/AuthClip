@@ -30,6 +30,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"html"
 	"io"
 	"io/fs"
 	"log"
@@ -59,7 +60,7 @@ const (
 	maxBody    = 128 << 10
 	maxLink    = 8192
 	sessionEC  = 20 * time.Second
-	appVersion = "v1.8.0" // v1.7.3: B 端清空｜v1.8.0: 出口 IP 风控画像（ip.net.coffee）
+	appVersion = "v1.8.1" // v1.8.0: IP 画像｜v1.8.1: 上游限流/缓存加固 + 自建 SVG 卡片
 )
 
 // ---------------------------------------------------------------- 模型
@@ -860,6 +861,7 @@ func (a *app) routes() (http.Handler, error) {
 	mux.HandleFunc("DELETE /api/slots/{id}", a.wrap(a.deleteSlot))
 	mux.HandleFunc("GET /api/mine", a.wrap(a.mine))
 	mux.HandleFunc("GET /api/ipcheck", a.wrap(a.ipCheck))
+	mux.HandleFunc("GET /api/slots/{id}/card.svg", a.wrap(a.slotCard))
 	mux.HandleFunc("POST /api/slots/{id}/report", a.wrap(a.report))
 	mux.HandleFunc("GET /api/stream", a.wrap(a.stream))
 	// 账号与权限（需要 all 范围）
@@ -1980,6 +1982,8 @@ var ipRiskClient = &http.Client{Timeout: 6 * time.Second}
 var (
 	riskMu    sync.Mutex
 	riskCache = map[string]riskEntry{}
+	riskSem   = make(chan struct{}, 4) // 上游并发上限
+	riskGate  sync.Map                 // B 端 /api/ipcheck 的每用户节流
 )
 
 type riskEntry struct {
@@ -1988,16 +1992,33 @@ type riskEntry struct {
 }
 
 func (a *app) lookupRisk(ip string) *IPRisk {
+	if os.Getenv("AUTHCLIP_IPRISK") == "0" {
+		return nil // 用 AUTHCLIP_IPRISK=0 可整体关闭上游查询
+	}
 	ip = strings.TrimSpace(ip)
 	if net.ParseIP(ip) == nil {
 		return nil
 	}
 	riskMu.Lock()
-	if e, ok := riskCache[ip]; ok && time.Since(e.at) < 10*time.Minute {
-		riskMu.Unlock()
-		return e.risk
+	if e, ok := riskCache[ip]; ok {
+		ttl := 30 * time.Minute
+		if e.risk != nil && e.risk.Err != "" {
+			ttl = 2 * time.Minute // 上游出错时短缓存，避免雪崩式重试
+		}
+		if time.Since(e.at) < ttl {
+			riskMu.Unlock()
+			return e.risk
+		}
 	}
 	riskMu.Unlock()
+
+	// 并发闸门：同一时刻最多 4 个上游请求，防止突发流量把我们和上游一起拖垮
+	select {
+	case riskSem <- struct{}{}:
+		defer func() { <-riskSem }()
+	case <-time.After(3 * time.Second):
+		return &IPRisk{IP: ip, Source: "ip.net.coffee", CheckedAt: time.Now().UTC(), Err: "排队超时"}
+	}
 
 	out := &IPRisk{IP: ip, Source: "ip.net.coffee", CheckedAt: time.Now().UTC()}
 	var raw ipriskJSON
@@ -2084,11 +2105,104 @@ func (a *app) enrichRisk(slotID, ip string) {
 }
 
 // ipCheck 给 B 端看自己的出口 IP 画像（提交前预览，提交时会再查一次并落库）
+// 自建 IP 卡片（SVG）：数据来自我们已存的 Risk，不依赖第三方渲染，
+// 也不会出现"显示的是查看者自己 IP"的问题（card.net.coffee 的卡片就是那样）。
+
+func (a *app) slotCard(w http.ResponseWriter, r *http.Request, u *User) {
+	sl := a.guardSlot(w, u, r.PathValue("id"))
+	if sl == nil {
+		return
+	}
+	w.Header().Set("Content-Type", "image/svg+xml; charset=utf-8")
+	w.Header().Set("Content-Disposition", `inline; filename="authclip-`+sl.ID+`.svg"`)
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write([]byte(renderCardSVG(sl)))
+}
+
+func esc(s string) string {
+	return html.EscapeString(s)
+}
+
+func renderCardSVG(s *Slot) string {
+	r := s.Risk
+	ip, trust, kind, flags, org, place := "—", "—", "—", "—", "—", "—"
+	tone := "#8b988f"
+	if r != nil {
+		ip = r.IP
+		trust = strconv.Itoa(r.TrustScore)
+		kind = riskKind(r)
+		flags = riskFlags(r)
+		org = riskOrg(r)
+		place = riskCity(r)
+		switch {
+		case r.TrustScore >= 80:
+			tone = "#146b4a" // 干净
+		case r.TrustScore >= 50:
+			tone = "#8a6d1f" // 一般
+		default:
+			tone = "#a3342c" // 风险高
+		}
+	}
+	label := s.Label
+	if label == "" {
+		label = "授权任务"
+	}
+	when := ""
+	if !s.Submitted.IsZero() {
+		when = s.Submitted.Local().Format("2006-01-02 15:04")
+	}
+
+	rows := [][2]string{
+		{"IP", ip},
+		{"信任分", trust},
+		{"IP 类型", kind},
+		{"风控标记", flags},
+		{"ASN / 组织", org},
+		{"城市", place},
+		{"回传时间", when},
+	}
+
+	var b strings.Builder
+	b.WriteString(`<svg xmlns="http://www.w3.org/2000/svg" width="560" height="300" viewBox="0 0 560 300" font-family="-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif">`)
+	b.WriteString(`<rect width="560" height="300" rx="16" fill="#f6f8f5"/>`)
+	b.WriteString(`<rect x="1" y="1" width="558" height="298" rx="15" fill="none" stroke="#dfe6dc"/>`)
+	// 标题
+	b.WriteString(`<circle cx="34" cy="36" r="9" fill="#146b4a"/>`)
+	b.WriteString(`<text x="52" y="41" font-size="15" font-weight="600" fill="#1c2a22">AuthClip</text>`)
+	b.WriteString(`<text x="118" y="41" font-size="13" fill="#8b988f">出口 IP 画像</text>`)
+	b.WriteString(`<text x="528" y="41" font-size="12" fill="#8b988f" text-anchor="end">` + esc(label) + `</text>`)
+	// 信任分大数字
+	b.WriteString(`<text x="34" y="104" font-size="13" fill="#8b988f">信任分</text>`)
+	b.WriteString(`<text x="34" y="150" font-size="42" font-weight="700" fill="` + tone + `">` + esc(trust) + `</text>`)
+	b.WriteString(`<text x="34" y="176" font-size="13" fill="` + tone + `">` + esc(kind) + `</text>`)
+	// 右侧明细
+	y := 76
+	for _, kv := range rows {
+		if kv[0] == "信任分" || kv[0] == "IP 类型" {
+			continue
+		}
+		b.WriteString(`<text x="230" y="` + strconv.Itoa(y) + `" font-size="11.5" fill="#8b988f">` + esc(kv[0]) + `</text>`)
+		b.WriteString(`<text x="330" y="` + strconv.Itoa(y) + `" font-size="12" fill="#1c2a22">` + esc(kv[1]) + `</text>`)
+		y += 26
+	}
+	b.WriteString(`<text x="34" y="278" font-size="10.5" fill="#a8b3ac">数据来源 ip.net.coffee · 采集于 ` + esc(time.Now().Local().Format("2006-01-02 15:04")) + `</text>`)
+	b.WriteString(`</svg>`)
+	return b.String()
+}
+
 func (a *app) ipCheck(w http.ResponseWriter, r *http.Request, u *User) {
 	if u.Role != "member" {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "仅接收人可用"})
 		return
 	}
+	// 每用户 5 秒最多一次：页面反复刷新不会把上游打成筛子（缓存之外的第二道闸）
+	if last, ok := riskGate.Load(u.ID); ok {
+		if t, _ := last.(time.Time); time.Since(t) < 5*time.Second {
+			writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "查询过于频繁，请稍后重试"})
+			return
+		}
+	}
+	riskGate.Store(u.ID, time.Now())
 	ip := a.observed(r)
 	risk := a.lookupRisk(ipText(ip))
 	if risk == nil {

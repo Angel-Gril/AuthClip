@@ -782,6 +782,10 @@ function adminSlotCard(slot) {
             },
           }),
           el("button", {
+            type: "button", text: "导出 IP 卡片", disabled: !slot.risk,
+            onclick: () => { void downloadCard(slot); },
+          }),
+          el("button", {
             type: "button", text: "复制整行", disabled: !copyAll,
             onclick: () => {
               if (stale && !window.confirm("这条回传与当前链接不一致（可能来自上一轮）。\n仍要复制吗？")) return;
@@ -822,6 +826,27 @@ async function downloadExport(format, masked = false) {
     a.remove();
     setTimeout(() => URL.revokeObjectURL(a.href), 5000);
       flash(masked ? "已导出脱敏版（凭证/邮箱/IP 打码）" : "已导出（含明文账号密码，请勿外传）");
+  } catch (e) {
+    flash(e.message, "err");
+  }
+}
+
+// 导出该任务的 IP 卡片（自建 SVG，数据来自已存画像）
+async function downloadCard(slot) {
+  try {
+    const res = await fetch(apiURL(`/api/slots/${slot.id}/card.svg`), {
+      headers: { "X-Token": state.token }, cache: "no-store",
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const blob = await res.blob();
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `authclip-${slot.id}-ip.svg`;
+    document.body.append(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    flash("已导出 IP 卡片（SVG）");
   } catch (e) {
     flash(e.message, "err");
   }
