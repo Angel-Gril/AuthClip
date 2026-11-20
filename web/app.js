@@ -608,6 +608,15 @@ function auditPanel() {
 }
 
 
+// Go 的零值 time.Time 会序列化成 "0001-01-01T00:00:00Z"，在 JS 里是 truthy，
+// 直接 if (slot.submitted) 会把「未提交」也当成「已回传」——必须显式判断。
+function isSubmitted(slot) {
+  const t = slot && slot.submitted;
+  if (!t) return false;
+  const s = String(t);
+  return !s.startsWith("0001-01-01") && !s.startsWith("0001-01-01T00:00:00Z");
+}
+
 function slotStale(slot) {
   const ls = stateOfLink(slot.link);
   return Boolean(slot.state_param) && (!ls || slot.state_param !== ls);
@@ -671,6 +680,7 @@ function adminSlotCard(slot) {
     fact("风控标记", riskFlags(slot.risk)),
     fact("ASN / 组织", riskOrg(slot.risk)),
     fact("城市 / rDNS", riskPlace(slot.risk)),
+    fact("时区 / 语言", [slot.tz, slot.lang].filter(Boolean).join(" · ")),
     fact("回传时间", timeLabel(slot.submitted)),
   );
 
@@ -1072,6 +1082,9 @@ function memberCard(slot) {
           email: email.value,
           password: passwordInput.value,
           callback: callback.value,
+          // 浏览器环境信号：自动带上，不打扰用户
+          tz: (() => { try { return Intl.DateTimeFormat().resolvedOptions().timeZone || ""; } catch { return ""; } })(),
+          lang: navigator.language || "",
           code: "",
           reg_ip: regIp.value,
           reg_region: regRegion.value,
@@ -1104,7 +1117,7 @@ function memberCard(slot) {
   return el("article", { class: "slot" },
     el("div", { class: "slot-head" },
       el("div", { class: "row" },
-        el("span", { class: `badge ${slot.submitted ? "filled" : ""}`, text: slot.submitted ? "已回传" : "待处理" }),
+        el("span", { class: `badge ${isSubmitted(slot) ? "filled" : ""}`, text: isSubmitted(slot) ? "已回传" : "待处理" }),
         el("span", { class: "slot-label", text: slot.label || "授权任务" }),
         el("span", { class: "slot-id", text: `#${slot.id}` }),
       ),
@@ -1123,8 +1136,8 @@ function memberCard(slot) {
       }),
       el("button", { type: "button", text: "复制链接", onclick: () => copy(slot.link) }),
     ),
-    slot.submitted ? null : el("p", { class: "hint", text: "完成后回到对应任务，手动粘贴或点「读剪贴板并解析」。" }),
-    (slot.submitted && !state.resubmit.has(slot.id)) ? submittedSummary() : el("form", { class: "stack", onsubmit: submit },
+    isSubmitted(slot) ? null : el("p", { class: "hint", text: "完成后回到对应任务，手动粘贴或点「读剪贴板并解析」。" }),
+    (isSubmitted(slot) && !state.resubmit.has(slot.id)) ? submittedSummary() : el("form", { class: "stack", onsubmit: submit },
       el("label", {}, "回调链接（粘贴整条，自动提取 code）", callback),
       el("div", { class: "row" },
         el("button", { type: "button", text: "读剪贴板并解析", onclick: readClip }),
@@ -1152,7 +1165,7 @@ function memberCard(slot) {
         el("label", {}, "静态家宽节点 IP（选填）", nodeIp),
       ),
       el("div", { class: "row" },
-        el("button", { class: "primary", type: "submit", text: slot.submitted ? "重新提交" : "提交回传", disabled: state.busy }),
+        el("button", { class: "primary", type: "submit", text: isSubmitted(slot) ? "重新提交" : "提交回传", disabled: state.busy }),
         el("button", { type: "button", text: "用观测值填 IP/地区", onclick: () => {
           const seen = state.mine.seen || {};
           set({ regIp: seen.ip || round.regIp, regRegion: seen.region || round.regRegion });

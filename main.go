@@ -60,7 +60,7 @@ const (
 	maxBody    = 128 << 10
 	maxLink    = 8192
 	sessionEC  = 20 * time.Second
-	appVersion = "v1.8.2" // v1.8.1: 限流/缓存 + SVG 卡片｜v1.8.2: 合并重复的出口 IP 展示
+	appVersion = "v1.8.3" // v1.8.2: 合并 IP 展示｜v1.8.3: 记录浏览器时区/语言
 )
 
 // ---------------------------------------------------------------- 模型
@@ -112,6 +112,10 @@ type Slot struct {
 
 	// 出口 IP 画像（提交时按观测 IP 向 ip.net.coffee 查询后落库）
 	Risk *IPRisk `json:"risk,omitempty"`
+
+	// 浏览器环境信号（B 提交时自带，无需填写）：用于对照 IP 归属地
+	TZ   string `json:"tz,omitempty"`   // 例：Asia/Shanghai
+	Lang string `json:"lang,omitempty"` // 例：zh-CN
 
 	// 服务端观测（仅 member 提交时写入）
 	SeenIP     string `json:"seen_ip"`
@@ -1461,6 +1465,7 @@ func (a *app) exportSlots(w http.ResponseWriter, r *http.Request, u *User) {
 					"password":   maskSecret(s.Password),
 					"reg_region": s.RegRegion, "reg_ip": maskIP(s.RegIP),
 					"seen_ip": maskIP(s.SeenIP), "node_ip": maskIP(s.NodeIP),
+					"tz": s.TZ, "lang": s.Lang,
 					"created": s.Created, "submitted": s.Submitted, "deleted": s.Deleted,
 					"redacted": true,
 				})
@@ -1481,7 +1486,7 @@ func (a *app) exportSlots(w http.ResponseWriter, r *http.Request, u *User) {
 	cw := csv.NewWriter(w)
 	_ = cw.Write([]string{
 		"id", "label", "状态", "接收人", "下发人", "邮箱", "密码", "凭证", "注册地区",
-		"注册IP", "观测IP", "节点IP", "信任分", "IP类型", "风控标记", "ASN组织", "城市", "rDNS",
+		"注册IP", "观测IP", "节点IP", "信任分", "IP类型", "风控标记", "ASN组织", "城市", "rDNS", "时区", "语言",
 		"创建时间", "回传时间", "已归档", "导出模式",
 	})
 	for _, s := range slots {
@@ -1497,6 +1502,7 @@ func (a *app) exportSlots(w http.ResponseWriter, r *http.Request, u *User) {
 			pick(s.Email, maskEmail), pick(s.Password, maskSecret), pick(s.Code, maskCode),
 			s.RegRegion, pick(s.RegIP, maskIP), pick(s.SeenIP, maskIP), pick(s.NodeIP, maskIP),
 			riskScore(s.Risk), riskKind(s.Risk), riskFlags(s.Risk), riskOrg(s.Risk), riskCity(s.Risk), riskRDNS(s.Risk),
+			s.TZ, s.Lang,
 			s.Created.Format("2006-01-02 15:04"), fmtTime(s.Submitted),
 			boolText(s.Deleted), mode,
 		}
@@ -1590,6 +1596,19 @@ func riskRDNS(r *IPRisk) string {
 	}
 	return r.RDNS
 }
+
+// clip 截断到 n 个字节以内（按 rune 边界，避免切坏多字节字符）
+func clip(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	r := []rune(s)
+	for len(string(r)) > n && len(r) > 0 {
+		r = r[:len(r)-1]
+	}
+	return string(r)
+}
+
 func spreadsheetText(value string) string {
 	first := strings.TrimLeftFunc(value, func(r rune) bool {
 		return unicode.IsSpace(r) || r == '\ufeff'
@@ -1862,6 +1881,7 @@ func clearReturned(s *Slot) {
 	s.Email, s.Code, s.Callback, s.StateParam = "", "", "", ""
 	s.Password = ""
 	s.Risk = nil
+	s.TZ, s.Lang = "", ""
 	s.RegIP, s.RegRegion, s.NodeIP = "", "", ""
 	s.SeenIP, s.SeenRegion = "", ""
 	s.Submitted = time.Time{}
@@ -2229,6 +2249,8 @@ func (a *app) report(w http.ResponseWriter, r *http.Request, u *User) {
 		RegIP     string `json:"reg_ip"`
 		RegRegion string `json:"reg_region"`
 		NodeIP    string `json:"node_ip"`
+		TZ        string `json:"tz"`
+		Lang      string `json:"lang"`
 		LinkGen   *int   `json:"link_gen"` // 必须回传页面看到的代次
 	}
 	if err := decode(w, r, &body); err != nil {
@@ -2236,6 +2258,8 @@ func (a *app) report(w http.ResponseWriter, r *http.Request, u *User) {
 	}
 	email := strings.TrimSpace(body.Email)
 	password := strings.TrimSpace(body.Password)
+	tz := clip(strings.TrimSpace(body.TZ), 64)
+	lang := clip(strings.TrimSpace(body.Lang), 32)
 	if len(password) > 200 {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "密码过长"})
 		return
@@ -2355,6 +2379,7 @@ func (a *app) report(w http.ResponseWriter, r *http.Request, u *User) {
 		}
 		s.Email, s.Code, s.Callback, s.StateParam = email, code, callback, stateParam
 		s.Password = password
+		s.TZ, s.Lang = tz, lang
 		s.NodeIP = node
 		s.RegIP = regIP
 		if s.RegIP == "" {

@@ -1229,3 +1229,37 @@ func TestMemberCannotReadBackOwnCredentials(t *testing.T) {
 		t.Fatal("应保留提交时间供 B 端确认")
 	}
 }
+
+// v1.8.3：浏览器环境信号（时区/语言）随回传一起落库，A 端可见
+func TestBrowserSignalsStoredAndCleared(t *testing.T) {
+	e := newEnv(t, "")
+	id := e.newSlot(t, e.b1)
+	if code, out := e.report(t, e.b1.Token, id, map[string]any{
+		"email": "sig@example.com", "password": "SigPass1",
+		"callback": "http://localhost:54545/callback?code=SIGC&state=STATE-ONE",
+		"tz":       "Asia/Shanghai", "lang": "zh-CN",
+	}); code != http.StatusOK {
+		t.Fatalf("回传失败: %d %v", code, out)
+	}
+	s := e.app.st.slotByID(id)
+	if s.TZ != "Asia/Shanghai" || s.Lang != "zh-CN" {
+		t.Fatalf("信号未落库: tz=%q lang=%q", s.TZ, s.Lang)
+	}
+	// 超长输入应被截断，不会撑爆状态文件
+	e.call(t, "POST", "/api/slots/"+id+"/clear", e.admin.Token, map[string]any{})
+	if code, _ := e.report(t, e.b1.Token, id, map[string]any{
+		"email":    "sig@example.com",
+		"callback": "http://localhost:54545/callback?code=SIGC&state=STATE-ONE",
+		"tz":       strings.Repeat("т", 200),
+	}); code != http.StatusOK {
+		t.Fatal("超长 tz 应被截断而非报错")
+	}
+	if got := e.app.st.slotByID(id).TZ; len(got) > 64 {
+		t.Fatalf("tz 未截断: %d 字节", len(got))
+	}
+	// 清空回传必须连信号一起清
+	e.call(t, "POST", "/api/slots/"+id+"/clear", e.admin.Token, map[string]any{})
+	if s := e.app.st.slotByID(id); s.TZ != "" || s.Lang != "" {
+		t.Fatalf("清空后信号残留: %q %q", s.TZ, s.Lang)
+	}
+}

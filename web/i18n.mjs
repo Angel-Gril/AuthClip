@@ -63,6 +63,7 @@ const DICT = {
   "风控标记": ["風控標記", "Risk flags"],
   "ASN / 组织": ["ASN / 組織", "ASN / org"],
   "城市 / rDNS": ["城市 / rDNS", "City / rDNS"],
+  "时区 / 语言": ["時區 / 語言", "Timezone / language"],
   "提交时会自动记录这份画像，方便 A 端核对账号环境；不需要你操作。": ["提交時會自動記錄這份畫像，方便 A 端核對帳號環境；不需要你操作。", "This profile is recorded automatically on submit so the admin can check the account environment — you don't need to do anything."],
   "住宅": ["住宅", "Residential"],
   "机房": ["機房", "Datacenter"],
