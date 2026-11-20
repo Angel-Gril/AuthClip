@@ -355,6 +355,10 @@ function parseCallback(text) {
       if (code && !notCode(code)) return { code, state: q.get("state") || "", raw: s };
     } catch { /* ignore */ }
   }
+  // 只拿到授权码（没有整条回调链接）：放行，但标记来源未校验
+  if (!/^https?:/i.test(s) && !/\s/.test(s) && s.length >= 16) {
+    return { code: s, state: "", raw: s, bare: true };
+  }
   return null;
 }
 
@@ -690,6 +694,7 @@ function adminSlotCard(slot) {
         el("span", { class: `badge ${filled ? "filled" : ""}`, text: filled ? "已回传" : "待回传" }),
         el("span", { class: "slot-label", text: slot.label || "未命名" }),
         el("span", { class: "muted", text: `→ ${member ? member.label : "未知接收人"}` }),
+        slot.unverified ? el("span", { class: "badge warn", text: "来源未校验" }) : null,
         stateMismatch ? el("span", { class: "badge warn", text: "state 不一致" }) : null,
         el("span", { class: "slot-id", text: `#${slot.id}` }),
       ),
@@ -1070,7 +1075,7 @@ function memberCard(slot) {
       return;
     }
     if (!callback.value.trim()) {
-      state.feedback = "请先粘贴整条回调链接";
+      state.feedback = "请先粘贴回调链接，或单独粘贴授权码";
       state.feedbackKind = "err";
       render();
       callback.focus();
@@ -1147,6 +1152,7 @@ function memberCard(slot) {
         ? el("div", { class: "picked" },
             el("span", { class: "k", text: "已提取 code" }),
             el("span", { class: "v", text: parsed.code }),
+            parsed.bare ? el("span", { class: "k warn", text: "未带 state，来源未校验" }) : null,
             match === true ? el("span", { class: "k", text: "state 与本条授权链接一致 ✓" }) : null,
             match === false ? el("span", { class: "k", text: "state 与本条链接不一致，确认是不是拿错了链接" }) : null,
           )

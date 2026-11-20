@@ -169,8 +169,12 @@ func TestReportRejectsForeignState(t *testing.T) {
 	if code, _ := with("http://localhost:54545/callback?code=OTHER&state=STATE-TWO"); code != http.StatusConflict {
 		t.Fatalf("state 不一致应 409，实际 %d", code)
 	}
-	if code, _ := with("http://localhost:54545/callback?code=NO-STATE"); code != http.StatusBadRequest {
-		t.Fatalf("缺 state 应 400，实际 %d", code)
+	// v1.8.4：缺 state 不再拒绝，改为接受并标记「来源未校验」
+	if code, _ := with("http://localhost:54545/callback?code=NO-STATE"); code != http.StatusOK {
+		t.Fatalf("缺 state 应接受（标记未校验），实际 %d", code)
+	}
+	if !e.app.st.slotByID(id).Unverified {
+		t.Fatal("缺 state 的回传应标记为未校验")
 	}
 	if code, out := with("http://localhost:54545/callback?code=GOOD&state=STATE-ONE"); code != http.StatusOK {
 		t.Fatalf("state 一致应通过，实际 %d %v", code, out)
@@ -582,16 +586,19 @@ func TestReportRequiresFullCallbackURL(t *testing.T) {
 	id := e.newSlot(t, e.b1)
 	base := map[string]any{"email": "b@example.com"}
 
-	// 裸授权码：拒
-	body := map[string]any{"email": "b@example.com", "code": "BARE-CODE-ONLY"}
-	if code, _ := e.report(t, e.b1.Token, id, body); code != http.StatusBadRequest {
-		t.Fatalf("裸 code 应被拒，实际 %d", code)
+	// v1.8.4：裸授权码接受（标记未校验）；过短的无效内容仍拒
+	body := map[string]any{"email": "b@example.com", "code": "BARE-CODE-ONLY-123456"}
+	if code, out := e.report(t, e.b1.Token, id, body); code != http.StatusOK {
+		t.Fatalf("裸 code 应被接受，实际 %d %v", code, out)
 	}
-	// 有 URL 但没 state：拒
+	if code, _ := e.report(t, e.b1.Token, id, map[string]any{"email": "b@example.com", "code": "short"}); code != http.StatusBadRequest {
+		t.Fatalf("过短内容应被拒，实际 %d", code)
+	}
+	// 有 URL 但没 state：接受（标记未校验）
 	_ = base
 	body = map[string]any{"email": "b@example.com", "callback": "http://localhost:54545/callback?code=X"}
-	if code, _ := e.report(t, e.b1.Token, id, body); code != http.StatusBadRequest {
-		t.Fatalf("缺 state 的回调应被拒，实际 %d", code)
+	if code, _ := e.report(t, e.b1.Token, id, body); code != http.StatusOK {
+		t.Fatalf("缺 state 的回调应接受（标记未校验），实际 %d", code)
 	}
 	// 完整且 state 匹配：通过
 	body = map[string]any{"email": "b@example.com", "callback": "http://localhost:54545/callback?code=OK&state=STATE-ONE"}
@@ -1261,5 +1268,47 @@ func TestBrowserSignalsStoredAndCleared(t *testing.T) {
 	e.call(t, "POST", "/api/slots/"+id+"/clear", e.admin.Token, map[string]any{})
 	if s := e.app.st.slotByID(id); s.TZ != "" || s.Lang != "" {
 		t.Fatalf("清空后信号残留: %q %q", s.TZ, s.Lang)
+	}
+}
+
+// v1.8.4：允许只交授权码；此时来源无法校验，必须标记出来
+func TestBareCodeAcceptedAndMarkedUnverified(t *testing.T) {
+	e := newEnv(t, "")
+	id := e.newSlot(t, e.b1)
+	bare := "1wnEt8iCT5CXyA9axH6BeShcMDkNuHA0VnN6i8gGQJ5hgUL-AWs8t9hgZPSuVLts2PwLa2MSNyFNH3KULKsBZq-ja4"
+	if code, out := e.report(t, e.b1.Token, id, map[string]any{
+		"email": "bare@example.com", "callback": bare,
+	}); code != http.StatusOK {
+		t.Fatalf("单独授权码应被接受: %d %v", code, out)
+	}
+	s := e.app.st.slotByID(id)
+	if s.Code != bare {
+		t.Fatalf("code 未落库: %q", s.Code)
+	}
+	if !s.Unverified {
+		t.Fatal("单独授权码必须标记为来源未校验")
+	}
+	if s.Callback != "" || s.StateParam != "" {
+		t.Fatalf("不该凭空生成回调链接: %q %q", s.Callback, s.StateParam)
+	}
+
+	// 带 state 的正常回传仍算已校验
+	id2 := e.newSlot(t, e.b1)
+	if code, _ := e.report(t, e.b1.Token, id2, map[string]any{
+		"email": "ok@example.com", "callback": "http://localhost:54545/callback?code=OK1&state=STATE-ONE",
+	}); code != http.StatusOK {
+		t.Fatal("正常回传失败")
+	}
+	if e.app.st.slotByID(id2).Unverified {
+		t.Fatal("带 state 的回传不该被标记未校验")
+	}
+
+	// 授权链接本身仍必须拒绝
+	id3 := e.newSlot(t, e.b1)
+	if code, _ := e.report(t, e.b1.Token, id3, map[string]any{
+		"email":    "x@example.com",
+		"callback": "https://claude.ai/oauth/authorize?client_id=X&response_type=code&state=S",
+	}); code != http.StatusBadRequest {
+		t.Fatalf("授权链接本身应 400，实际 %d", code)
 	}
 }

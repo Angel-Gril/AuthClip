@@ -60,7 +60,7 @@ const (
 	maxBody    = 128 << 10
 	maxLink    = 8192
 	sessionEC  = 20 * time.Second
-	appVersion = "v1.8.3" // v1.8.2: 合并 IP 展示｜v1.8.3: 记录浏览器时区/语言
+	appVersion = "v1.8.4" // v1.8.3: 时区/语言｜v1.8.4: 允许只交授权码（标记来源未校验）
 )
 
 // ---------------------------------------------------------------- 模型
@@ -102,6 +102,7 @@ type Slot struct {
 	// B 回传
 	Email      string    `json:"email"`
 	Password   string    `json:"password"`
+	Unverified bool      `json:"unverified,omitempty"` // 只交 code、没有 state：来源无法校验
 	Code       string    `json:"code"`
 	Callback   string    `json:"callback"`
 	StateParam string    `json:"state_param"`
@@ -1486,7 +1487,7 @@ func (a *app) exportSlots(w http.ResponseWriter, r *http.Request, u *User) {
 	cw := csv.NewWriter(w)
 	_ = cw.Write([]string{
 		"id", "label", "状态", "接收人", "下发人", "邮箱", "密码", "凭证", "注册地区",
-		"注册IP", "观测IP", "节点IP", "信任分", "IP类型", "风控标记", "ASN组织", "城市", "rDNS", "时区", "语言",
+		"注册IP", "观测IP", "节点IP", "信任分", "IP类型", "风控标记", "ASN组织", "城市", "rDNS", "时区", "语言", "来源校验",
 		"创建时间", "回传时间", "已归档", "导出模式",
 	})
 	for _, s := range slots {
@@ -1502,7 +1503,7 @@ func (a *app) exportSlots(w http.ResponseWriter, r *http.Request, u *User) {
 			pick(s.Email, maskEmail), pick(s.Password, maskSecret), pick(s.Code, maskCode),
 			s.RegRegion, pick(s.RegIP, maskIP), pick(s.SeenIP, maskIP), pick(s.NodeIP, maskIP),
 			riskScore(s.Risk), riskKind(s.Risk), riskFlags(s.Risk), riskOrg(s.Risk), riskCity(s.Risk), riskRDNS(s.Risk),
-			s.TZ, s.Lang,
+			s.TZ, s.Lang, verifiedText(s.Unverified),
 			s.Created.Format("2006-01-02 15:04"), fmtTime(s.Submitted),
 			boolText(s.Deleted), mode,
 		}
@@ -1516,6 +1517,13 @@ func (a *app) exportSlots(w http.ResponseWriter, r *http.Request, u *User) {
 
 // spreadsheetText keeps formula-like values as text when opening the CSV in a spreadsheet.
 // ---- IP 画像的文本化（导出与前端共用同一套判定语义）----
+
+func verifiedText(unverified bool) string {
+	if unverified {
+		return "未校验"
+	}
+	return "已校验"
+}
 
 func riskScore(r *IPRisk) string {
 	if r == nil {
@@ -1882,6 +1890,7 @@ func clearReturned(s *Slot) {
 	s.Password = ""
 	s.Risk = nil
 	s.TZ, s.Lang = "", ""
+	s.Unverified = false
 	s.RegIP, s.RegRegion, s.NodeIP = "", "", ""
 	s.SeenIP, s.SeenRegion = "", ""
 	s.Submitted = time.Time{}
@@ -2231,6 +2240,13 @@ func (a *app) ipCheck(w http.ResponseWriter, r *http.Request, u *User) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ip": risk.IP, "region": a.country(ip), "risk": risk})
 }
+
+// looksLikeAuthURL 判断用户是不是把「授权链接本身」当回传内容交上来了
+func looksLikeAuthURL(s string) bool {
+	return strings.Contains(s, "claude.ai/oauth") || strings.Contains(s, "code_challenge") ||
+		strings.Contains(s, "response_type=") || strings.Contains(s, "redirect_uri=")
+}
+
 func (a *app) report(w http.ResponseWriter, r *http.Request, u *User) {
 	if u.Role != "member" {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "仅接收人可回传"})
@@ -2268,26 +2284,37 @@ func (a *app) report(w http.ResponseWriter, r *http.Request, u *User) {
 	code := strings.TrimSpace(body.Code)
 	stateParam := ""
 
-	// 只接受「整条回调链接」：code 与 state 必须来自同一次回调。
-	// 允许把它塞进 code 框（前端有用户会粘错位置），但仍要求是带 ?code=&state= 的 URL。
+	// 两种回传都接受：
+	//   1) 整条回调链接（含 code 与 state）—— 可校验归属
+	//   2) 只有授权码 —— 放行，但落库时标记「来源未校验」
+	// 把内容塞进 code 框（有人会粘错位置）按同样规则处理。
 	if callback == "" {
 		callback = code
 		code = ""
 	}
-	if !strings.Contains(callback, "code=") {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error": "请粘贴整条回调链接（形如 http://localhost:54545/callback?code=…&state=…），不接受单独的授权码",
-		})
-		return
-	}
-	if c, st, ok := parseCallback(callback); ok {
+	if strings.Contains(callback, "code=") {
+		c, st, ok := parseCallback(callback)
+		if !ok {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error": "无法从这条链接里取出 code，请确认粘的是回调链接",
+			})
+			return
+		}
 		code, stateParam = c, st
-	}
-	if stateParam == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error": "回调链接里没有 state，无法确认它属于本次授权",
-		})
-		return
+	} else {
+		if looksLikeAuthURL(callback) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error": "这是授权链接本身，不是回传内容；请先完成授权再回传",
+			})
+			return
+		}
+		if len(callback) < 16 || strings.ContainsAny(callback, " \t\r\n") {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error": "内容无法识别：请粘贴整条回调链接，或单独粘贴授权码（无空格）",
+			})
+			return
+		}
+		code, callback, stateParam = callback, "", ""
 	}
 
 	regIP := strings.TrimSpace(body.RegIP)
@@ -2343,14 +2370,15 @@ func (a *app) report(w http.ResponseWriter, r *http.Request, u *User) {
 
 	// 服务端核对 OAuth 归属：回调里的 state 必须与当前授权链接里的 state 一致。
 	// 链接本身没有 state 时不再「跳过校验」，而是直接拒绝（无 state 即无法绑定）。
+	// 只交 code 的情况（stateParam == ""）跳过归属校验，落库时标记「未校验」
 	want := linkStateOf(sl.Link)
-	if want == "" {
+	if stateParam != "" && want == "" {
 		writeJSON(w, http.StatusConflict, map[string]string{
 			"error": "该任务的授权链接缺少 state，无法校验回调归属，请管理员更新链接",
 		})
 		return
 	}
-	if stateParam != want {
+	if stateParam != "" && stateParam != want {
 		writeJSON(w, http.StatusConflict, map[string]string{
 			"error": "回调的 state 与当前授权链接不一致，可能拿错了链接（或该任务已改派/换过链接）",
 		})
@@ -2373,13 +2401,16 @@ func (a *app) report(w http.ResponseWriter, r *http.Request, u *User) {
 			return errors.New("link generation changed")
 		}
 		// 链接在提交期间被换掉：按新链接重新比一次
-		if cur := linkStateOf(s.Link); cur == "" || cur != stateParam {
-			denied = true
-			return errors.New("link changed")
+		if stateParam != "" {
+			if cur := linkStateOf(s.Link); cur == "" || cur != stateParam {
+				denied = true
+				return errors.New("link changed")
+			}
 		}
 		s.Email, s.Code, s.Callback, s.StateParam = email, code, callback, stateParam
 		s.Password = password
 		s.TZ, s.Lang = tz, lang
+		s.Unverified = stateParam == ""
 		s.NodeIP = node
 		s.RegIP = regIP
 		if s.RegIP == "" {
