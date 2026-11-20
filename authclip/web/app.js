@@ -6,6 +6,11 @@
 //   2) 点「读剪贴板」→ navigator.clipboard.readText()（一次手势，Chrome 允许）
 // 两条都走同一个 parseCallback()，不依赖任何服务端出站请求。
 
+// 部署在子路径（如 /clip/）时，页面内的请求必须相对当前目录解析，
+// 否则 /api/... 会打到根站（另一个应用）上。
+const PAGE_ROOT = new URL("./", document.baseURI).href;
+const apiURL = (p) => new URL(String(p).replace(/^\/+/, ""), PAGE_ROOT).href;
+
 const appEl = document.querySelector("#app");
 const connEl = document.querySelector("#conn");
 const roleEl = document.querySelector("#role");
@@ -87,7 +92,7 @@ function readToken() {
 }
 
 async function api(path, opts = {}) {
-  const res = await fetch(path, {
+  const res = await fetch(apiURL(path), {
     cache: "no-store",
     method: opts.method ?? (opts.body ? "POST" : "GET"),
     headers: {
@@ -117,7 +122,7 @@ async function startStream() {
   const run = async () => {
     while (!closed) {
       try {
-        const res = await fetch("/api/stream", {
+        const res = await fetch(apiURL("/api/stream"), {
           headers: { "X-Token": state.token },
           cache: "no-store",
           signal: ctl.signal,
@@ -699,7 +704,7 @@ function fact(label, value, wide = false) {
 async function downloadExport(format, secrets = false) {
   try {
     const qs = secrets ? `format=${format}&secrets=1&confirm=EXPORT` : `format=${format}`;
-    const res = await fetch(`/api/export?${qs}`, {
+    const res = await fetch(apiURL(`/api/export?${qs}`), {
       headers: { "X-Token": state.token }, cache: "no-store",
     });
     if (!res.ok) {
