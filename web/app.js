@@ -337,7 +337,7 @@ function maskLink(link) {
 
 function memberPanel() {
   const input = el("input", { id: "new-member", maxlength: 40, placeholder: "新接收人名字" });
-  const uname = el("input", { id: "new-member-username", maxlength: 32, autocomplete: "off", placeholder: "用户名（选填，如 b03）" });
+  const uname = el("input", { id: "new-member-username", maxlength: 32, autocomplete: "off", placeholder: "用户名（选填，中英文均可，如 b03 / 张三）" });
   const add = async (event) => {
     event.preventDefault();
     if (state.busy) return;
@@ -1124,6 +1124,7 @@ document.addEventListener("visibilitychange", () => {
 });
 
 void start();
+
 
 
 

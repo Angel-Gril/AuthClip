@@ -1102,3 +1102,57 @@ func TestSpreadsheetTextCases(t *testing.T) {
 		}
 	}
 }
+
+// v1.6：中文用户名（此前规范化把非 ASCII 全丢，导致纯中文用户名一律报"已被占用"）
+func TestChineseUsernameWorks(t *testing.T) {
+	e := newEnv(t, "")
+
+	// 1) 显式中文用户名
+	code, out := e.call(t, "POST", "/api/members", e.admin.Token, map[string]any{
+		"label": "张三", "username": "张三",
+	})
+	if code != http.StatusOK {
+		t.Fatalf("中文用户名应可用，实际 %d %v", code, out)
+	}
+	if out["username"] != "张三" {
+		t.Fatalf("用户名被改写：%v", out["username"])
+	}
+
+	// 2) 重名 -> 409（不是 400）
+	if code, _ := e.call(t, "POST", "/api/members", e.admin.Token, map[string]any{
+		"label": "另一个张三", "username": "张三",
+	}); code != http.StatusConflict {
+		t.Fatalf("重名应 409，实际 %d", code)
+	}
+
+	// 3) 纯符号用户名 -> 400（格式非法），不能报成"已被占用"
+	if code, body := e.call(t, "POST", "/api/members", e.admin.Token, map[string]any{
+		"label": "符号", "username": "!!!",
+	}); code != http.StatusBadRequest {
+		t.Fatalf("纯符号应 400，实际 %d %v", code, body)
+	}
+
+	// 4) 不填用户名，从中文标签派生
+	code, out = e.call(t, "POST", "/api/members", e.admin.Token, map[string]any{"label": "李四"})
+	if code != http.StatusOK {
+		t.Fatalf("创建失败：%d %v", code, out)
+	}
+	if out["username"] != "李四" {
+		t.Fatalf("应从标签派生「李四」，实际 %v", out["username"])
+	}
+
+	// 5) 改名为中文
+	if code, _ := e.call(t, "PATCH", "/api/users/"+e.b1.ID, e.admin.Token, map[string]any{"username": "王五"}); code != http.StatusOK {
+		t.Fatalf("改名失败：%d", code)
+	}
+	if u := e.app.st.userByID(e.b1.ID); u.Username != "王五" {
+		t.Fatalf("改名结果不对：%q", u.Username)
+	}
+
+	// 6) 用中文用户名下发任务
+	if code, out := e.call(t, "POST", "/api/slots", e.admin.Token, map[string]any{
+		"member": "王五", "link": testLink, "label": "中文下发",
+	}); code != http.StatusOK {
+		t.Fatalf("按中文用户名下发失败：%d %v", code, out)
+	}
+}

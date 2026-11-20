@@ -56,7 +56,7 @@ const (
 	maxBody    = 128 << 10
 	maxLink    = 8192
 	sessionEC  = 20 * time.Second
-	appVersion = "v1.5.4" // v1.5.2: 代次强制｜v1.5.3: 去掉自动读剪贴板｜v1.5.4: 合并审查方 CSV 实现
+	appVersion = "v1.6.0" // v1.5.4: 合并 CSV 实现｜v1.6.0: 支持中文用户名 / 区分非法与占用
 )
 
 // ---------------------------------------------------------------- 模型
@@ -289,22 +289,26 @@ func newToken() string {
 }
 
 // normalizeUsername：小写、只留 a-z0-9._-，空格转 -
+// normalizeUsername 保留 Unicode 字母与数字（因此中文用户名可用），
+// 空格转 '-'，其它符号丢弃；长度按字符数限制在 32 以内。
 func normalizeUsername(s string) string {
 	s = strings.ToLower(strings.TrimSpace(s))
 	var b strings.Builder
+	count := 0
 	for _, r := range s {
+		if count >= 32 {
+			break
+		}
 		switch {
-		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '.', r == '_', r == '-':
+		case unicode.IsLetter(r) || unicode.IsDigit(r), r == '.', r == '_', r == '-':
 			b.WriteRune(r)
+			count++
 		case r == ' ' || r == '\t':
 			b.WriteRune('-')
+			count++
 		}
 	}
-	out := strings.Trim(b.String(), "-._")
-	if len(out) > 32 {
-		out = out[:32]
-	}
-	return out
+	return strings.Trim(b.String(), "-._")
 }
 
 // uniqueUsernameLocked 在锁内生成不冲突的用户名
@@ -342,8 +346,14 @@ func (s *store) addUser(role, scope, label, username string) (*User, error) {
 	if want == "" {
 		want = "user-" + newToken()[:4] // 纯中文/符号标签：给一个可辨识的默认名
 	}
+	// 显式指定了用户名：先判断是否"根本没解析出可用字符"（纯符号/emoji），
+	// 这与"已被占用"是两回事，必须分开报，否则中文/符号用户名总被说成占用。
+	if username != "" {
+		if normalizeUsername(username) == "" {
+			return nil, errUsernameInvalid
+		}
+	}
 	final := s.uniqueUsernameLocked(want)
-	// 显式指定了用户名但已被占用：直接报错，不静默改名
 	if username != "" && normalizeUsername(username) != final {
 		return nil, errUsernameTaken
 	}
@@ -364,7 +374,11 @@ func (s *store) addUser(role, scope, label, username string) (*User, error) {
 	return &cp, nil
 }
 
-var errUsernameTaken = errors.New("用户名已被占用")
+var (
+	errUsernameTaken = errors.New("用户名已被占用")
+	// 用户名规范化后为空（纯符号/emoji）与"已被占用"是两回事，必须分开报
+	errUsernameInvalid = errors.New("用户名不合法")
+)
 
 // migrateUsernames：老数据没有 username，启动时补齐
 func (s *store) migrateUsernames() {
@@ -1081,7 +1095,9 @@ func (a *app) addMember(w http.ResponseWriter, r *http.Request, u *User) {
 	}
 	m, err := a.st.addUser("member", "", label, body.Username)
 	if err != nil {
-		if errors.Is(err, errUsernameTaken) {
+		if errors.Is(err, errUsernameInvalid) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "用户名不合法：至少要有 1 个字母/数字/汉字"})
+		} else if errors.Is(err, errUsernameTaken) {
 			writeJSON(w, http.StatusConflict, map[string]string{"error": "用户名已被占用"})
 		} else {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "写入失败"})
@@ -1191,7 +1207,9 @@ func (a *app) createUser(w http.ResponseWriter, r *http.Request, u *User) {
 	}
 	nu, err := a.st.addUser(role, scope, label, body.Username)
 	if err != nil {
-		if errors.Is(err, errUsernameTaken) {
+		if errors.Is(err, errUsernameInvalid) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "用户名不合法：至少要有 1 个字母/数字/汉字"})
+		} else if errors.Is(err, errUsernameTaken) {
 			writeJSON(w, http.StatusConflict, map[string]string{"error": "用户名已被占用"})
 		} else {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "写入失败"})
@@ -1243,8 +1261,8 @@ func (a *app) patchUser(w http.ResponseWriter, r *http.Request, u *User) {
 		}
 		if body.Username != nil {
 			want := normalizeUsername(*body.Username)
-			if len(want) < 2 {
-				return errUsernameTaken
+			if len([]rune(want)) < 1 {
+				return errUsernameInvalid
 			}
 			for _, other := range a.st.d.Users {
 				if other.ID != x.ID && strings.EqualFold(other.Username, want) {
@@ -2105,3 +2123,4 @@ func plausibleURL(s string) bool {
 	}
 	return host != "" && !strings.ContainsAny(host, " \t\r\n")
 }
+
