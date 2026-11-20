@@ -63,6 +63,31 @@ function flash(text, kind = "ok") {
   render();
 }
 
+// 统一的「忙」执行器：先复位 busy 再渲染，避免错误后按钮被画成灰的却再也不恢复。
+// fn 内部只改 state.feedback，不直接 render（否则还是 busy=true 的那一帧）。
+async function busyRun(fn, { fallback = "error", focus = "" } = {}) {
+  if (state.busy) return false;
+  state.busy = true;
+  state.feedback = "";
+  render();
+  let err = null;
+  try {
+    await fn();
+  } catch (e) {
+    err = e;
+  }
+  state.busy = false;
+  if (err) {
+    state.feedback = errorMessage(err, fallback);
+    state.feedbackKind = "err";
+    render();
+    if (focus) document.getElementById(focus)?.focus();
+    return false;
+  }
+  render();
+  return true;
+}
+
 async function copy(text, label = "已复制") {
   if (!text) return flash("没有可复制的内容", "err");
   try {
@@ -303,18 +328,21 @@ function newSlotForm() {
       String(m.label).toLowerCase() === v.toLowerCase());
     if (!hit) return flash("请填写接收人用户名", "err");
     if (hit.revoked) return flash("该接收人已吊销", "err");
-    state.busy = true;
-    try {
+    if (!link.value.trim()) {
+      state.feedback = "请先粘贴授权链接";
+      state.feedbackKind = "err";
+      render();
+      link.focus();
+      return;
+    }
+    await busyRun(async () => {
       await api("/api/slots", {
         body: { member: hit.id, link: link.value, label: label.value },
       });
-      flash("已下发；对方打开自己的长期链接就能看到");
+      state.feedback = "已下发；对方打开自己的长期链接就能看到";
+      state.feedbackKind = "ok";
       await refresh();
-    } catch (e) {
-      flash(e.message, "err");
-    } finally {
-      state.busy = false;
-    }
+    });
   };
 
   return el("form", { class: "card stack", onsubmit: submit },
@@ -341,16 +369,12 @@ function memberPanel() {
   const add = async (event) => {
     event.preventDefault();
     if (state.busy) return;
-    state.busy = true;
-    try {
+    await busyRun(async () => {
       const m = await api("/api/members", { body: { label: input.value, username: uname.value } });
-      flash(`已创建「${m.label}」，长期链接已可复制`);
+      state.feedback = `已创建「${m.label}」，长期链接已可复制`;
+      state.feedbackKind = "ok";
       await refresh();
-    } catch (e) {
-      flash(e.message, "err");
-    } finally {
-      state.busy = false;
-    }
+    });
   };
   const list = (state.board.members || []).map((m) => {
     // 长期链接不再随列表下发（防批量泄露）：要发就重新签发一条，只显示一次
@@ -463,8 +487,7 @@ function usersPanel() {
   const create = async (event) => {
     event.preventDefault();
     if (state.busy) return;
-    state.busy = true;
-    try {
+    const ok = await busyRun(async () => {
       const r = await api("/api/users", {
         body: {
           role: roleSel.value, scope: scopeSel.value,
@@ -473,11 +496,8 @@ function usersPanel() {
       });
       await copy(r.link, "已创建，长期链接已复制（只显示这一次）");
       await refresh();
-    } catch (e) {
-      flash(e.message, "err");
-    } finally {
-      state.busy = false;
-    }
+    });
+    void ok;
   };
 
   return el("div", { class: "card stack" },
@@ -924,8 +944,22 @@ function memberCard(slot) {
   const submit = async (event) => {
     event.preventDefault();
     if (state.busy) return;
-    state.busy = true;
-    try {
+    // 本地先挡一道：空邮箱/空回调不必往返服务端，也不会把按钮卡住
+    if (!email.value.trim()) {
+      state.feedback = "请先填写注册邮箱";
+      state.feedbackKind = "err";
+      render();
+      email.focus();
+      return;
+    }
+    if (!callback.value.trim()) {
+      state.feedback = "请先粘贴整条回调链接";
+      state.feedbackKind = "err";
+      render();
+      callback.focus();
+      return;
+    }
+    const ok = await busyRun(async () => {
       await api(`/api/slots/${slot.id}/report`, {
         body: {
           email: email.value,
@@ -938,13 +972,11 @@ function memberCard(slot) {
         },
       });
       state.rounds.delete(slot.id);
-      flash("已回传，对方会立刻看到；再提交一次可覆盖");
+      state.feedback = "已回传，对方会立刻看到；再提交一次可覆盖";
+      state.feedbackKind = "ok";
       await refresh();
-    } catch (e) {
-      flash(e.message, "err");
-    } finally {
-      state.busy = false;
-    }
+    }, { focus: "report-email" });
+    void ok;
   };
 
   return el("article", { class: "slot" },
