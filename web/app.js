@@ -39,6 +39,7 @@ const state = {
   rounds: new Map(),
   reveal: new Set(),
   resubmit: new Set(), // B 端点「重新提交」后临时展开表单
+  ipRisk: null,        // B 端出口 IP 画像（提交前预览）
   stopStream: null,
 };
 
@@ -75,6 +76,40 @@ function translateTree(root) {
       if (v) n.setAttribute(attr, t(v));
     }
   }
+}
+
+// ---- IP 画像的展示口径（与导出列保持一致）----
+function riskScore(r) {
+  if (!r) return "";
+  return String(r.trust_score ?? "");
+}
+function riskKind(r) {
+  if (!r) return "";
+  if (r.is_residential) return "住宅";
+  if (r.is_datacenter) return "机房";
+  if (r.kind === "mobile") return "移动";
+  return r.kind || "未知";
+}
+function riskFlags(r) {
+  if (!r) return "";
+  const f = [];
+  if (r.is_vpn) f.push("VPN");
+  if (r.is_proxy) f.push("代理");
+  if (r.is_tor) f.push("Tor");
+  if (r.is_crawler) f.push("爬虫");
+  if (r.is_abuser) f.push("滥用");
+  if (r.is_datacenter) f.push("数据中心");
+  return f.length ? f.join("/") : "无";
+}
+function riskOrg(r) {
+  if (!r) return "";
+  const org = r.org || "";
+  return r.asn ? `${org} (AS${r.asn})` : org;
+}
+function riskPlace(r) {
+  if (!r) return "";
+  const place = r.city ? `${r.country} / ${r.city}` : (r.country || "");
+  return r.rdns ? `${place} · ${r.rdns}` : place;
 }
 
 const mono = (t, cls = "mono") => el("span", { class: cls, text: t ?? "" });
@@ -278,6 +313,9 @@ async function refresh() {
       state.board = await api("/api/board");
     } else {
       state.mine = await api("/api/mine");
+  if (state.role === "member") {
+    try { state.ipRisk = (await api("/api/ipcheck")).risk || null; } catch { state.ipRisk = null; }
+  }
       dropStaleRounds();
     }
   } catch (e) {
@@ -628,6 +666,11 @@ function adminSlotCard(slot) {
     fact("注册 IP", slot.reg_ip),
     fact("观测 IP", slot.seen_ip),
     fact("节点 IP", slot.node_ip),
+    fact("信任分", riskScore(slot.risk)),
+    fact("IP 类型", riskKind(slot.risk)),
+    fact("风控标记", riskFlags(slot.risk)),
+    fact("ASN / 组织", riskOrg(slot.risk)),
+    fact("城市 / rDNS", riskPlace(slot.risk)),
     fact("回传时间", timeLabel(slot.submitted)),
   );
 
@@ -926,11 +969,6 @@ function memberCard(slot) {
   const email = el("input", { type: "email", autocomplete: "off", maxlength: 254, placeholder: "注册这个账号用的邮箱" });
   // 有些账号要密码登录；默认 type=password，可一键显示
   const passwordInput = el("input", { type: "password", autocomplete: "new-password", maxlength: 200, placeholder: "该账号的登录密码（不需要可留空）" });
-  const passwordToggle = el("button", { type: "button", class: "ghost", text: "显示", onclick: () => {
-    const show = passwordInput.type === "password";
-    passwordInput.type = show ? "text" : "password";
-    passwordToggle.textContent = t(show ? "隐藏" : "显示");
-  } });
   email.value = round.email;
   email.addEventListener("input", () => set({ email: email.value }));
   passwordInput.value = round.password;
@@ -1078,10 +1116,7 @@ function memberCard(slot) {
       parsed?.auth ? el("p", { class: "feedback err", text: "这是授权链接本身（含 code_challenge），不是回调链接。请先点开完成授权。" }) : null,
       el("div", { class: "grid-2" },
         el("label", {}, "注册邮箱", email),
-        el("div", { class: "stack" },
-          el("label", {}, "登录密码（如该账号需要）"),
-          el("div", { class: "row" }, passwordInput, passwordToggle),
-        ),
+        el("label", {}, "登录密码（如该账号需要）", passwordInput),
       ),
       el("div", { class: "grid-2" },
         el("label", {}, "注册地区（两位国家码）", regRegion),
@@ -1113,6 +1148,17 @@ function memberView() {
       el("h1", { text: "我的授权" }),
       el("p", { class: "muted", text: "点开对方给的授权链接，完成授权后把地址栏的回调链接粘回来。" }),
     ),
+    state.ipRisk ? el("div", { class: "card stack" },
+      el("h3", { text: "出口 IP 画像" }),
+      el("dl", { class: "facts" },
+        fact("IP", state.ipRisk.ip),
+        fact("信任分", riskScore(state.ipRisk)),
+        fact("IP 类型", riskKind(state.ipRisk)),
+        fact("风控标记", riskFlags(state.ipRisk)),
+        fact("ASN / 组织", riskOrg(state.ipRisk)),
+      ),
+      el("p", { class: "hint", text: "提交时会自动记录这份画像，方便 A 端核对账号环境；不需要你操作。" }),
+    ) : null,
     el("div", { class: "card row" },
       el("span", { class: "hint", text: "本次连接的出口" }),
       mono(seen.ip || "服务端取不到（内网/本地）", "mono ink"),

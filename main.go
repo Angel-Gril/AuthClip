@@ -33,6 +33,7 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"net/mail"
 	"net/netip"
@@ -40,6 +41,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -57,7 +59,7 @@ const (
 	maxBody    = 128 << 10
 	maxLink    = 8192
 	sessionEC  = 20 * time.Second
-	appVersion = "v1.7.3" // v1.7.2: 导出默认明文｜v1.7.3: B 端提交后不再下发凭证
+	appVersion = "v1.8.0" // v1.7.3: B 端清空｜v1.8.0: 出口 IP 风控画像（ip.net.coffee）
 )
 
 // ---------------------------------------------------------------- 模型
@@ -106,6 +108,9 @@ type Slot struct {
 	RegRegion  string    `json:"reg_region"`
 	NodeIP     string    `json:"node_ip"`
 	Submitted  time.Time `json:"submitted"`
+
+	// 出口 IP 画像（提交时按观测 IP 向 ip.net.coffee 查询后落库）
+	Risk *IPRisk `json:"risk,omitempty"`
 
 	// 服务端观测（仅 member 提交时写入）
 	SeenIP     string `json:"seen_ip"`
@@ -854,6 +859,7 @@ func (a *app) routes() (http.Handler, error) {
 	mux.HandleFunc("POST /api/slots/{id}/clear", a.wrap(a.clearSlot))
 	mux.HandleFunc("DELETE /api/slots/{id}", a.wrap(a.deleteSlot))
 	mux.HandleFunc("GET /api/mine", a.wrap(a.mine))
+	mux.HandleFunc("GET /api/ipcheck", a.wrap(a.ipCheck))
 	mux.HandleFunc("POST /api/slots/{id}/report", a.wrap(a.report))
 	mux.HandleFunc("GET /api/stream", a.wrap(a.stream))
 	// 账号与权限（需要 all 范围）
@@ -1473,7 +1479,8 @@ func (a *app) exportSlots(w http.ResponseWriter, r *http.Request, u *User) {
 	cw := csv.NewWriter(w)
 	_ = cw.Write([]string{
 		"id", "label", "状态", "接收人", "下发人", "邮箱", "密码", "凭证", "注册地区",
-		"注册IP", "观测IP", "节点IP", "创建时间", "回传时间", "已归档", "导出模式",
+		"注册IP", "观测IP", "节点IP", "信任分", "IP类型", "风控标记", "ASN组织", "城市", "rDNS",
+		"创建时间", "回传时间", "已归档", "导出模式",
 	})
 	for _, s := range slots {
 		state := "待回传"
@@ -1487,6 +1494,7 @@ func (a *app) exportSlots(w http.ResponseWriter, r *http.Request, u *User) {
 			s.ID, s.Label, state, label[s.Member], label[s.Owner],
 			pick(s.Email, maskEmail), pick(s.Password, maskSecret), pick(s.Code, maskCode),
 			s.RegRegion, pick(s.RegIP, maskIP), pick(s.SeenIP, maskIP), pick(s.NodeIP, maskIP),
+			riskScore(s.Risk), riskKind(s.Risk), riskFlags(s.Risk), riskOrg(s.Risk), riskCity(s.Risk), riskRDNS(s.Risk),
 			s.Created.Format("2006-01-02 15:04"), fmtTime(s.Submitted),
 			boolText(s.Deleted), mode,
 		}
@@ -1499,6 +1507,87 @@ func (a *app) exportSlots(w http.ResponseWriter, r *http.Request, u *User) {
 }
 
 // spreadsheetText keeps formula-like values as text when opening the CSV in a spreadsheet.
+// ---- IP 画像的文本化（导出与前端共用同一套判定语义）----
+
+func riskScore(r *IPRisk) string {
+	if r == nil {
+		return ""
+	}
+	return strconv.Itoa(r.TrustScore)
+}
+
+func riskKind(r *IPRisk) string {
+	if r == nil {
+		return ""
+	}
+	switch {
+	case r.IsResidential:
+		return "住宅"
+	case r.IsDatacenter:
+		return "机房"
+	case r.Kind == "mobile":
+		return "移动"
+	case r.Kind != "":
+		return r.Kind
+	}
+	return "未知"
+}
+
+func riskFlags(r *IPRisk) string {
+	if r == nil {
+		return ""
+	}
+	var f []string
+	if r.IsVPN {
+		f = append(f, "VPN")
+	}
+	if r.IsProxy {
+		f = append(f, "代理")
+	}
+	if r.IsTor {
+		f = append(f, "Tor")
+	}
+	if r.IsCrawler {
+		f = append(f, "爬虫")
+	}
+	if r.IsAbuser {
+		f = append(f, "滥用")
+	}
+	if r.IsDatacenter {
+		f = append(f, "数据中心")
+	}
+	if len(f) == 0 {
+		return "无"
+	}
+	return strings.Join(f, "/")
+}
+
+func riskOrg(r *IPRisk) string {
+	if r == nil {
+		return ""
+	}
+	if r.ASN > 0 {
+		return fmt.Sprintf("%s (AS%d)", r.Org, r.ASN)
+	}
+	return r.Org
+}
+
+func riskCity(r *IPRisk) string {
+	if r == nil {
+		return ""
+	}
+	if r.City == "" {
+		return r.Country
+	}
+	return r.Country + " / " + r.City
+}
+
+func riskRDNS(r *IPRisk) string {
+	if r == nil {
+		return ""
+	}
+	return r.RDNS
+}
 func spreadsheetText(value string) string {
 	first := strings.TrimLeftFunc(value, func(r rune) bool {
 		return unicode.IsSpace(r) || r == '\ufeff'
@@ -1770,6 +1859,7 @@ func (a *app) clearSlot(w http.ResponseWriter, r *http.Request, u *User) {
 func clearReturned(s *Slot) {
 	s.Email, s.Code, s.Callback, s.StateParam = "", "", "", ""
 	s.Password = ""
+	s.Risk = nil
 	s.RegIP, s.RegRegion, s.NodeIP = "", "", ""
 	s.SeenIP, s.SeenRegion = "", ""
 	s.Submitted = time.Time{}
@@ -1834,6 +1924,179 @@ func (a *app) mine(w http.ResponseWriter, r *http.Request, u *User) {
 	})
 }
 
+// 出口 IP 画像：按 IP 向 ip.net.coffee 的公开接口查询（geoip + iprisk），
+// 结果存进任务里，供 A 端判断账号注册环境的风控特征。
+// 这些接口带 Access-Control-Allow-Origin: *，但我们统一由服务端调用：
+// 浏览器侧会被广告拦截器/隐私插件影响，且无法跨域读 SVG 卡片。
+
+type IPRisk struct {
+	IP            string    `json:"ip"`
+	CIDR          string    `json:"cidr"`
+	Kind          string    `json:"kind"` // residential / hosting / mobile …
+	TrustScore    int       `json:"trust_score"`
+	IsVPN         bool      `json:"is_vpn"`
+	IsProxy       bool      `json:"is_proxy"`
+	IsTor         bool      `json:"is_tor"`
+	IsCrawler     bool      `json:"is_crawler"`
+	IsAbuser      bool      `json:"is_abuser"`
+	IsDatacenter  bool      `json:"is_datacenter"`
+	IsResidential bool      `json:"is_residential"`
+	ASN           int       `json:"asn"`
+	Org           string    `json:"org"`
+	Country       string    `json:"country"`
+	City          string    `json:"city"`
+	RDNS          string    `json:"rdns"`
+	AbuserScore   string    `json:"abuser_score"`
+	Source        string    `json:"source"`
+	CheckedAt     time.Time `json:"checked_at"`
+	Err           string    `json:"err,omitempty"`
+}
+
+// ipriskJSON 对应上游返回的字段（只取需要的）
+type ipriskJSON struct {
+	IP            string `json:"ip"`
+	CIDR          string `json:"cidr"`
+	IsDatacenter  bool   `json:"is_datacenter"`
+	IsResidential bool   `json:"isResidential"`
+	IsVPN         bool   `json:"is_vpn"`
+	IsProxy       bool   `json:"is_proxy"`
+	IsTor         bool   `json:"is_tor"`
+	IsCrawler     bool   `json:"is_crawler"`
+	IsAbuser      bool   `json:"is_abuser"`
+	ASN           int    `json:"asn"`
+	AsOrg         string `json:"asOrganization"`
+	Country       string `json:"country"`
+	City          string `json:"city"`
+	RDNS          string `json:"rdns"`
+	AbuserScore   string `json:"abuser_score"`
+	TrustScore    int    `json:"trust_score"`
+	ASNKind       string `json:"asn_kind"`
+	CompanyType   string `json:"company_type"`
+}
+
+var ipRiskClient = &http.Client{Timeout: 6 * time.Second}
+
+// riskCache 按 IP 缓存 10 分钟：B 端页面轮询 / 多次提交都不会反复打上游
+var (
+	riskMu    sync.Mutex
+	riskCache = map[string]riskEntry{}
+)
+
+type riskEntry struct {
+	risk *IPRisk
+	at   time.Time
+}
+
+func (a *app) lookupRisk(ip string) *IPRisk {
+	ip = strings.TrimSpace(ip)
+	if net.ParseIP(ip) == nil {
+		return nil
+	}
+	riskMu.Lock()
+	if e, ok := riskCache[ip]; ok && time.Since(e.at) < 10*time.Minute {
+		riskMu.Unlock()
+		return e.risk
+	}
+	riskMu.Unlock()
+
+	out := &IPRisk{IP: ip, Source: "ip.net.coffee", CheckedAt: time.Now().UTC()}
+	var raw ipriskJSON
+	if err := httpGetJSON(ipRiskClient, "https://ip.net.coffee/api/iprisk/"+url.PathEscape(ip), &raw); err == nil {
+		out.CIDR = raw.CIDR
+		out.TrustScore = raw.TrustScore
+		out.IsVPN, out.IsProxy, out.IsTor = raw.IsVPN, raw.IsProxy, raw.IsTor
+		out.IsCrawler, out.IsAbuser = raw.IsCrawler, raw.IsAbuser
+		out.IsDatacenter, out.IsResidential = raw.IsDatacenter, raw.IsResidential
+		out.ASN, out.Org = raw.ASN, raw.AsOrg
+		out.Country, out.City = raw.Country, raw.City
+		out.RDNS, out.AbuserScore = raw.RDNS, raw.AbuserScore
+		out.Kind = raw.ASNKind
+		switch {
+		case out.Kind == "" && raw.CompanyType != "":
+			out.Kind = raw.CompanyType
+		case out.Kind == "" && raw.IsDatacenter:
+			out.Kind = "hosting"
+		case out.Kind == "" && raw.IsResidential:
+			out.Kind = "residential"
+		}
+	} else {
+		out.Err = "上游查询失败"
+	}
+
+	// 地理信息缺失时用 geoip 端点补
+	if out.Country == "" || out.City == "" {
+		var geo struct {
+			Country     string `json:"country"`
+			CountryCode string `json:"country_code"`
+			City        string `json:"city"`
+			ISP         string `json:"isp"`
+		}
+		if err := httpGetJSON(ipRiskClient, "https://ip.net.coffee/api/geoip/"+url.PathEscape(ip), &geo); err == nil {
+			if out.Country == "" {
+				out.Country = geo.Country
+			}
+			if out.City == "" {
+				out.City = geo.City
+			}
+			if out.Org == "" {
+				out.Org = geo.ISP
+			}
+		}
+	}
+
+	riskMu.Lock()
+	riskCache[ip] = riskEntry{risk: out, at: time.Now()}
+	riskMu.Unlock()
+	return out
+}
+
+func httpGetJSON(c *http.Client, u string, dst any) error {
+	req, err := http.NewRequest(http.MethodGet, u, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "AuthClip/"+appVersion)
+	res, err := c.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = res.Body.Close() }()
+	if res.StatusCode != http.StatusOK {
+		return fmt.Errorf("status %d", res.StatusCode)
+	}
+	return json.NewDecoder(io.LimitReader(res.Body, 64<<10)).Decode(dst)
+}
+
+// enrichRisk 提交成功后异步补画像：不阻塞 B 的提交，也不影响主流程
+func (a *app) enrichRisk(slotID, ip string) {
+	risk := a.lookupRisk(ip)
+	if risk == nil {
+		return
+	}
+	_, _ = a.st.updateSlot(slotID, func(s *Slot) error {
+		if s.Deleted {
+			return errors.New("archived")
+		}
+		s.Risk = risk
+		return nil
+	})
+}
+
+// ipCheck 给 B 端看自己的出口 IP 画像（提交前预览，提交时会再查一次并落库）
+func (a *app) ipCheck(w http.ResponseWriter, r *http.Request, u *User) {
+	if u.Role != "member" {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "仅接收人可用"})
+		return
+	}
+	ip := a.observed(r)
+	risk := a.lookupRisk(ipText(ip))
+	if risk == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"ip": ipText(ip), "region": a.country(ip)})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ip": risk.IP, "region": a.country(ip), "risk": risk})
+}
 func (a *app) report(w http.ResponseWriter, r *http.Request, u *User) {
 	if u.Role != "member" {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "仅接收人可回传"})
@@ -2002,6 +2265,9 @@ func (a *app) report(w http.ResponseWriter, r *http.Request, u *User) {
 		return
 	}
 	a.st.appendAudit(&Audit{Actor: u.ID, Label: u.Label, Action: "slot.report", Slot: updated.ID})
+	if s := updated; s != nil && s.RegIP != "" {
+		go a.enrichRisk(s.ID, s.RegIP) // 异步补 IP 画像，不拖慢提交
+	}
 	writeJSON(w, http.StatusOK, updated)
 }
 
