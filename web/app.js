@@ -667,7 +667,7 @@ function adminSlotCard(slot) {
     })(),
   );
 
-  const nodeInput = el("input", { placeholder: "静态家宽节点 IP（可留空）" });
+  const nodeInput = el("input", { maxlength: 200, placeholder: "ip / ip:port / ip:port:user:pass / socks5://user:pass@host:port" });
   nodeInput.value = slot.node_ip || "";
   const regionInput = el("input", { placeholder: "地区，如 JP", maxlength: 2 });
   regionInput.value = slot.reg_region || "";
@@ -749,7 +749,7 @@ function adminSlotCard(slot) {
         ),
         edit,
         el("div", { class: "grid-2" },
-          el("label", {}, "节点 IP（管理员补充）", nodeInput),
+          el("label", {}, "节点/代理（管理员补充）", nodeInput),
           el("label", {}, "地区", regionInput),
         ),
         el("div", { class: "row" },
@@ -1064,7 +1064,7 @@ function memberCard(slot) {
   regRegion.value = round.regRegion;
   regRegion.addEventListener("input", () => set({ regRegion: regRegion.value.toUpperCase() }));
 
-  const nodeIp = el("input", { placeholder: "静态家宽节点 IP（选填）" });
+  const nodeIp = el("input", { maxlength: 200, placeholder: "如 154.196.210.126:7778:user:pass 或 socks5://user:pass@host:port" });
   nodeIp.value = round.nodeIp;
   nodeIp.addEventListener("input", () => set({ nodeIp: nodeIp.value }));
 
@@ -1173,7 +1173,7 @@ function memberCard(slot) {
       ),
       el("div", { class: "grid-2" },
         el("label", {}, "注册区域 IP", regIp),
-        el("label", {}, "静态家宽节点 IP（选填）", nodeIp),
+        el("label", {}, "静态/动态家宽节点或代理（选填）", nodeIp),
       ),
       el("div", { class: "row" },
         el("button", { class: "primary", type: "submit", text: isSubmitted(slot) ? "重新提交" : "提交回传", disabled: state.busy }),

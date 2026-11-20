@@ -60,7 +60,7 @@ const (
 	maxBody    = 128 << 10
 	maxLink    = 8192
 	sessionEC  = 20 * time.Second
-	appVersion = "v1.8.5" // v1.8.4: 允许只交授权码｜v1.8.5: A/B 两端显示自己的名字与用户名
+	appVersion = "v1.8.6" // v1.8.5: 身份显示｜v1.8.6: 节点字段支持 ip:port:user:pass / socks5 等代理写法
 )
 
 // ---------------------------------------------------------------- 模型
@@ -1465,7 +1465,7 @@ func (a *app) exportSlots(w http.ResponseWriter, r *http.Request, u *User) {
 					"email": maskEmail(s.Email), "code": maskCode(s.Code),
 					"password":   maskSecret(s.Password),
 					"reg_region": s.RegRegion, "reg_ip": maskIP(s.RegIP),
-					"seen_ip": maskIP(s.SeenIP), "node_ip": maskIP(s.NodeIP),
+					"seen_ip": maskIP(s.SeenIP), "node_ip": maskNode(s.NodeIP),
 					"tz": s.TZ, "lang": s.Lang,
 					"created": s.Created, "submitted": s.Submitted, "deleted": s.Deleted,
 					"redacted": true,
@@ -1501,7 +1501,7 @@ func (a *app) exportSlots(w http.ResponseWriter, r *http.Request, u *User) {
 		row := []string{
 			s.ID, s.Label, state, label[s.Member], label[s.Owner],
 			pick(s.Email, maskEmail), pick(s.Password, maskSecret), pick(s.Code, maskCode),
-			s.RegRegion, pick(s.RegIP, maskIP), pick(s.SeenIP, maskIP), pick(s.NodeIP, maskIP),
+			s.RegRegion, pick(s.RegIP, maskIP), pick(s.SeenIP, maskIP), pick(s.NodeIP, maskNode),
 			riskScore(s.Risk), riskKind(s.Risk), riskFlags(s.Risk), riskOrg(s.Risk), riskCity(s.Risk), riskRDNS(s.Risk),
 			s.TZ, s.Lang, verifiedText(s.Unverified),
 			s.Created.Format("2006-01-02 15:04"), fmtTime(s.Submitted),
@@ -1669,6 +1669,21 @@ func maskEmail(s string) string {
 	return head + "***" + domain
 }
 
+// maskNode 节点/代理串可能不是纯 IP（ip:port:user:pass、socks5://…），按字符串打码
+func maskNode(v string) string {
+	if v == "" {
+		return ""
+	}
+	if ip, err := netip.ParseAddr(v); err == nil {
+		return maskIP(ip.Unmap().String())
+	}
+	r := []rune(v)
+	if len(r) <= 8 {
+		return "***"
+	}
+	return string(r[:8]) + "***"
+}
+
 func maskIP(s string) string {
 	if s == "" {
 		return ""
@@ -1781,12 +1796,9 @@ func (a *app) patchSlot(w http.ResponseWriter, r *http.Request, u *User) {
 		}
 	}
 	if body.NodeIP != nil {
-		v := strings.TrimSpace(*body.NodeIP)
-		if v != "" {
-			if _, err := netip.ParseAddr(v); err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "节点 IP 格式不正确"})
-				return
-			}
+		if _, ok := normalizeNode(*body.NodeIP); !ok {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "节点/代理内容过长或含非法字符"})
+			return
 		}
 	}
 	if body.Region != nil {
@@ -1837,7 +1849,9 @@ func (a *app) patchSlot(w http.ResponseWriter, r *http.Request, u *User) {
 			}
 		}
 		if body.NodeIP != nil {
-			s.NodeIP = strings.TrimSpace(*body.NodeIP)
+			if v, ok := normalizeNode(*body.NodeIP); ok {
+				s.NodeIP = v
+			}
 		}
 		if body.Region != nil {
 			s.RegRegion = strings.ToUpper(strings.TrimSpace(*body.Region))
@@ -2242,6 +2256,26 @@ func (a *app) ipCheck(w http.ResponseWriter, r *http.Request, u *User) {
 }
 
 // looksLikeAuthURL 判断用户是不是把「授权链接本身」当回传内容交上来了
+// normalizeNode 处理「静态/动态家宽节点」的各种写法：
+//
+//	154.196.210.126 / 154.196.210.126:7778 / 154.196.210.126:7778:user:pass
+//	socks5://user:pass@host:1080 / host.example.com:8080
+//
+// 能解析成纯 IP 就规范化；否则原样保留（限长、禁控制字符）。
+func normalizeNode(v string) (string, bool) {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return "", true
+	}
+	if len(v) > 200 || strings.ContainsAny(v, "\r\n\t") {
+		return "", false
+	}
+	if ip, err := netip.ParseAddr(v); err == nil {
+		return ip.Unmap().String(), true
+	}
+	return v, true
+}
+
 func looksLikeAuthURL(s string) bool {
 	return strings.Contains(s, "claude.ai/oauth") || strings.Contains(s, "code_challenge") ||
 		strings.Contains(s, "response_type=") || strings.Contains(s, "redirect_uri=")
@@ -2345,13 +2379,11 @@ func (a *app) report(w http.ResponseWriter, r *http.Request, u *User) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "注册地区请填两位国家代码"})
 		return
 	}
-	if node != "" {
-		ip, err := netip.ParseAddr(node)
-		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "节点 IP 格式不正确"})
-			return
-		}
-		node = ip.Unmap().String()
+	if v, ok := normalizeNode(node); ok {
+		node = v
+	} else {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "节点/代理内容过长或含非法字符"})
+		return
 	}
 
 	// 代次校验：换过链接就必须重新取页面，否则旧请求会把上一轮结果写回来

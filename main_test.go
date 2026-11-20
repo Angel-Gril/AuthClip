@@ -1312,3 +1312,38 @@ func TestBareCodeAcceptedAndMarkedUnverified(t *testing.T) {
 		t.Fatalf("授权链接本身应 400，实际 %d", code)
 	}
 }
+
+// v1.8.6：节点/代理字段不再要求纯 IP（家宽节点常带端口与账号密码）
+func TestNodeAcceptsProxyFormats(t *testing.T) {
+	e := newEnv(t, "")
+	cases := []string{
+		"154.196.210.126",
+		"154.196.210.126:7778",
+		"154.196.210.126:7778:9J5Y7M3S3h5H5o4x1o8u8z0",
+		"154.196.210.126:7778:user:pass",
+		"socks5://user:pass@host.example.com:1080",
+		"host.example.com:8080",
+	}
+	for _, node := range cases {
+		id := e.newSlot(t, e.b1)
+		if code, out := e.report(t, e.b1.Token, id, map[string]any{
+			"email":    "n@example.com",
+			"callback": "http://localhost:54545/callback?code=N1&state=STATE-ONE",
+			"node_ip":  node,
+		}); code != http.StatusOK {
+			t.Fatalf("%q 应被接受，实际 %d %v", node, code, out)
+		}
+		if got := e.app.st.slotByID(id).NodeIP; got != node {
+			t.Fatalf("落库不一致：want %q got %q", node, got)
+		}
+	}
+	// 过长仍拒
+	id := e.newSlot(t, e.b1)
+	if code, _ := e.report(t, e.b1.Token, id, map[string]any{
+		"email":    "n@example.com",
+		"callback": "http://localhost:54545/callback?code=N1&state=STATE-ONE",
+		"node_ip":  strings.Repeat("a", 201),
+	}); code != http.StatusBadRequest {
+		t.Fatalf("超长应 400，实际 %d", code)
+	}
+}
