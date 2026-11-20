@@ -60,7 +60,7 @@ const (
 	maxBody    = 128 << 10
 	maxLink    = 8192
 	sessionEC  = 20 * time.Second
-	appVersion = "v1.8.4" // v1.8.3: 时区/语言｜v1.8.4: 允许只交授权码（标记来源未校验）
+	appVersion = "v1.8.5" // v1.8.4: 允许只交授权码｜v1.8.5: A/B 两端显示自己的名字与用户名
 )
 
 // ---------------------------------------------------------------- 模型
@@ -1949,7 +1949,7 @@ func (a *app) mine(w http.ResponseWriter, r *http.Request, u *User) {
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"role": "member", "label": u.Label,
+		"role": "member", "label": u.Label, "username": u.Username,
 		"slots": redacted,
 		"seen":  map[string]string{"ip": ipText(ip), "region": a.country(ip)},
 	})

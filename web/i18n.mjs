@@ -133,7 +133,9 @@ const DICT = {
 
   // ---------- 账号与权限 ----------
   "账号与权限": ["帳號與權限", "Accounts & permissions"],
+  "当前身份": ["目前身分", "Signed in as"],
   "管理员·全量": ["管理員·全域", "Admin · full"],
+  "管理员·限自己": ["管理員·限自己", "Admin · own only"],
   "管理员·限自己": ["管理員·限自己", "Admin · own only"],
   "轮换链接": ["輪換連結", "Rotate link"],
   "吊销": ["撤銷", "Revoke"],

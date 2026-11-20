@@ -162,3 +162,33 @@ button[disabled] { opacity: .45; cursor: default; }
 .chip, .conn { white-space: nowrap; flex: 0 0 auto; }
 .lang { flex: 0 0 auto; }
 
+.chip.who { background: #eef3ec; color: #2f4a3c; }
+.who-line { margin-top: 4px; font-size: 12.5px; }
+
+
+/* 头部拥挤修复：身份芯片过长时省略，不把整行顶爆 */
+.top-inner { min-width: 0; gap: 12px; }
+.top-actions { flex-wrap: nowrap; min-width: 0; overflow: hidden; }
+.chip, .conn { white-space: nowrap; }
+.lang { flex: 0 0 auto; max-width: 130px; }
+.chip.who {
+  background: #eef3ec; color: #2f4a3c; flex: 0 1 auto;
+  min-width: 0; max-width: 190px; overflow: hidden; text-overflow: ellipsis;
+}
+.chip.admin, .conn { flex: 0 0 auto; }
+.who-line { margin-top: 4px; font-size: 12.5px; word-break: break-word; }
+
+
+
+/* 身份芯片：放在最后 + !important，确保不被 flex 压缩成省略号 */
+.top-actions .chip.who {
+  flex: 0 0 auto !important;
+  min-width: auto !important;
+  max-width: 260px !important;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 头部右侧不要裁切（之前 overflow:hidden 会把「实时已连接」切掉） */
+.top-actions { overflow: visible !important; }

@@ -16,6 +16,7 @@ const appEl = document.querySelector("#app");
 const connEl = document.querySelector("#conn");
 const roleEl = document.querySelector("#role");
 const langSel = document.querySelector("#lang");
+const whoEl = document.querySelector("#who");
 
 // 语言：手动选择优先，其次浏览器语言；默认简体
 let manualLocale = localStorage.getItem("ac-locale") || "auto";
@@ -40,6 +41,7 @@ const state = {
   reveal: new Set(),
   resubmit: new Set(), // B 端点「重新提交」后临时展开表单
   ipRisk: null,        // B 端出口 IP 画像（提交前预览）
+  me: null,            // 当前身份 {label, username}
   stopStream: null,
 };
 
@@ -311,11 +313,13 @@ async function refresh() {
   try {
     if (state.role === "admin") {
       state.board = await api("/api/board");
+      state.me = (state.board.users || []).find((x) => x.self) || null;
     } else {
       state.mine = await api("/api/mine");
   if (state.role === "member") {
     try { state.ipRisk = (await api("/api/ipcheck")).risk || null; } catch { state.ipRisk = null; }
   }
+      state.me = { label: state.mine.label, username: state.mine.username };
       dropStaleRounds();
     }
   } catch (e) {
@@ -874,6 +878,7 @@ function adminView() {
     el("div", {},
       el("h1", { text: "授权中继" }),
       el("p", { class: "muted", text: "下发授权链接 → 对方打开并回传凭证 → 这里复制。" }),
+      whoLine(),
     ),
     all ? el("div", { class: "row" },
       el("button", { type: "button", text: "导出 CSV", onclick: () => downloadExport("csv") }),
@@ -1193,6 +1198,7 @@ function memberView() {
     el("div", {},
       el("h1", { text: "我的授权" }),
       el("p", { class: "muted", text: "点开对方给的授权链接，完成授权后把地址栏的回调链接粘回来。" }),
+      whoLine(),
     ),
     prof ? el("div", { class: "card stack" },
       el("h3", { text: "出口 IP 画像" }),
@@ -1246,9 +1252,33 @@ function landing() {
 
 // ---------------------------------------------------------------- 渲染与启动
 
+// 「我是谁」：名字 + 用户名，A/B 两端一眼可辨
+function whoText() {
+  const me = state.me || {};
+  const name = me.label || "";
+  const user = me.username ? "@" + me.username : "";
+  return [name, user].filter(Boolean).join(" ");
+}
+
+// 页面正文里的身份行（服务端角色 + 名字 + 用户名）
+function whoLine() {
+  if (!state.me) return null;
+  const role = state.role === "admin"
+    ? (state.me.scope === "own" ? "管理员·限自己" : "管理员·全量")
+    : "接收人";
+  return el("p", { class: "muted who-line", text: `${t("当前身份")}：${whoText()}（${t(role)}）` });
+}
+
 function render() {
-  roleEl.hidden = !state.role;
+  // 身份芯片已经写明「名字 @用户名（角色在正文那行）」，角色徽标就不再重复占位
+  roleEl.hidden = !state.role || Boolean(state.me);
   connEl.hidden = !state.role;
+  if (state.me) {
+    whoEl.hidden = false;
+    whoEl.textContent = whoText();
+  } else {
+    whoEl.hidden = true;
+  }
   if (state.role) {
     roleEl.className = `chip ${state.role === "admin" ? "admin" : ""}`;
     roleEl.textContent = t(state.role === "admin" ? "管理员" : "接收人");
