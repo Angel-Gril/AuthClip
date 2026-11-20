@@ -596,7 +596,8 @@ func TestReportRequiresFullCallbackURL(t *testing.T) {
 	}
 }
 
-func TestExportIsMaskedByDefaultAndAuditedFirst(t *testing.T) {
+// v1.7.2：管理员需要直接看账号密码 → 导出默认明文，打码版走 ?masked=1
+func TestExportDefaultsToPlaintextMaskedOption(t *testing.T) {
 	e := newEnv(t, "")
 	id := e.newSlot(t, e.b1)
 	e.report(t, e.b1.Token, id, map[string]any{
@@ -615,15 +616,17 @@ func TestExportIsMaskedByDefaultAndAuditedFirst(t *testing.T) {
 		return res.StatusCode, string(raw)
 	}
 
+	// 默认：明文（管理员日常要复制账号密码）
 	code, body := get("?format=csv")
 	if code != http.StatusOK {
 		t.Fatalf("export: %d", code)
 	}
-	if strings.Contains(body, "SUPERSECRETCODE") || strings.Contains(body, "b1@example.com") {
-		t.Fatalf("默认导出泄露明文：\n%s", body)
+	if !strings.Contains(body, "SUPERSECRETCODE") || !strings.Contains(body, "b1@example.com") {
+		t.Fatalf("默认导出应为明文：\n%s", body)
 	}
-	if !strings.Contains(body, "……") && !strings.Contains(body, "***") {
-		t.Fatalf("默认导出应打码：\n%s", body)
+	// 打码版：显式 ?masked=1
+	if _, masked := get("?format=csv&masked=1"); strings.Contains(masked, "SUPERSECRETCODE") || !strings.Contains(masked, "***") {
+		t.Fatalf("?masked=1 应打码：\n%s", masked)
 	}
 
 	// 完整导出必须二次确认
@@ -1174,7 +1177,7 @@ func TestPasswordReportAndMasking(t *testing.T) {
 
 	// 脱敏导出：出现打码，不出现明文
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/api/export?format=csv", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/export?format=csv&masked=1", nil)
 	e.app.exportSlots(rec, req, e.admin)
 	body := rec.Body.String()
 	if strings.Contains(body, "S3cret!pass") {

@@ -57,7 +57,7 @@ const (
 	maxBody    = 128 << 10
 	maxLink    = 8192
 	sessionEC  = 20 * time.Second
-	appVersion = "v1.7.1" // v1.7.0: 三语界面｜v1.7.1: 接收端可回传登录密码（默认打码）
+	appVersion = "v1.7.2" // v1.7.1: 密码回传｜v1.7.2: 导出默认明文，打码改为 ?masked=1
 )
 
 // ---------------------------------------------------------------- 模型
@@ -1405,8 +1405,9 @@ func (a *app) exportSlots(w http.ResponseWriter, r *http.Request, u *User) {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "需要全量权限的管理员"})
 		return
 	}
-	full := r.URL.Query().Get("secrets") == "1"
-	if full && r.URL.Query().Get("confirm") != "EXPORT" {
+	// 管理员要看账号密码：默认给明文；需要打码版加 ?masked=1（两种都留审计）
+	full := r.URL.Query().Get("masked") != "1"
+	if r.URL.Query().Get("secrets") == "1" && r.URL.Query().Get("confirm") != "EXPORT" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
 			"error": "导出完整凭据需要 ?secrets=1&confirm=EXPORT 二次确认",
 		})

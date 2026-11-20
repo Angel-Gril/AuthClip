@@ -137,6 +137,11 @@ const DICT = {
   "只记录「谁对哪条任务做了什么」，不含凭证内容。": ["只記錄「誰對哪條任務做了什麼」，不含憑證內容。", "Records who did what to which task — never the credentials."],
 
   // ---------- 导出 ----------
+  "导出脱敏 CSV": ["匯出去識別 CSV", "Export masked CSV"],
+  "CSV/JSON 默认含明文的邮箱、密码与凭证（方便直接复制）；脱敏版会把这几列打码。两种导出都会留审计。": ["CSV/JSON 預設含明文的信箱、密碼與憑證（方便直接複製）；去識別版會把這幾欄打碼。兩種匯出都會留稽核。", "CSV/JSON include plaintext email, password and code by default (easy to copy). The masked version redacts those columns. Both are audited."],
+  "已导出脱敏版（凭证/邮箱/IP 打码）": ["已匯出去識別版（憑證/信箱/IP 打碼）", "Masked export done (code/email/IP redacted)"],
+  "已导出（含明文账号密码，请勿外传）": ["已匯出（含明文帳號密碼，請勿外傳）", "Exported with plaintext credentials — do not share the file"],
+  "默认脱敏（凭证/邮箱/IP 打码）；完整导出会二次确认并留审计。": ["預設去識別（憑證/信箱/IP 打碼）；完整匯出會二次確認並留稽核。", "Masked by default (code/email/IP); full export asks for confirmation and is audited."],
   "导出 CSV": ["匯出 CSV", "Export CSV"],
   "导出 JSON": ["匯出 JSON", "Export JSON"],
   "导出完整凭据": ["匯出完整憑證", "Export full credentials"],

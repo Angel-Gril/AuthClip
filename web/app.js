@@ -758,9 +758,9 @@ function fact(label, value, wide = false) {
 }
 
 // 导出：token 走请求头，用 fetch 拿 blob 再触发下载（<a href> 带不了头）
-async function downloadExport(format, secrets = false) {
+async function downloadExport(format, masked = false) {
   try {
-    const qs = secrets ? `format=${format}&secrets=1&confirm=EXPORT` : `format=${format}`;
+    const qs = masked ? `format=${format}&masked=1` : `format=${format}`;
     const res = await fetch(apiURL(`/api/export?${qs}`), {
       headers: { "X-Token": state.token }, cache: "no-store",
     });
@@ -777,7 +777,7 @@ async function downloadExport(format, secrets = false) {
     a.click();
     a.remove();
     setTimeout(() => URL.revokeObjectURL(a.href), 5000);
-      flash(secrets ? "已导出完整凭据（含已归档）——这份文件请勿外传" : "已导出（默认脱敏，含已归档任务）");
+      flash(masked ? "已导出脱敏版（凭证/邮箱/IP 打码）" : "已导出（含明文账号密码，请勿外传）");
   } catch (e) {
     flash(e.message, "err");
   }
@@ -794,14 +794,8 @@ function adminView() {
     all ? el("div", { class: "row" },
       el("button", { type: "button", text: "导出 CSV", onclick: () => downloadExport("csv") }),
       el("button", { type: "button", text: "导出 JSON", onclick: () => downloadExport("json") }),
-      el("button", {
-        type: "button", class: "danger", text: "导出完整凭据",
-        onclick: () => {
-          if (!window.confirm("将导出明文凭证、邮箱与完整 IP，文件泄露等于凭证泄露。\n确认继续？")) return;
-          void downloadExport("csv", true);
-        },
-      }),
-      el("span", { class: "hint", text: "默认脱敏（凭证/邮箱/IP 打码）；完整导出会二次确认并留审计。" }),
+      el("button", { type: "button", text: "导出脱敏 CSV", onclick: () => { void downloadExport("csv", true); } }),
+      el("span", { class: "hint", text: "CSV/JSON 默认含明文的邮箱、密码与凭证（方便直接复制）；脱敏版会把这几列打码。两种导出都会留审计。" }),
     ) : null,
     (() => {
       const n = slots.filter(slotStale).length;
