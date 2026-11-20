@@ -60,7 +60,7 @@ const (
 	maxBody    = 128 << 10
 	maxLink    = 8192
 	sessionEC  = 20 * time.Second
-	appVersion = "v1.8.7" // v1.8.6: 节点支持代理写法｜v1.8.7: 管理端把回填结果提到下发下方
+	appVersion = "v1.8.8" // v1.8.7: 结果提到下发下方｜v1.8.8: 归档只留 A 端（折叠），B 端不再下发
 )
 
 // ---------------------------------------------------------------- 模型
@@ -1085,7 +1085,19 @@ func (a *app) board(w http.ResponseWriter, r *http.Request, u *User) {
 		slots = own
 	}
 
-	resp := map[string]any{"members": members, "slots": slots, "scope": u.scopeOf()}
+	// 归档（A 端删除的任务）：单独给一份，前端折叠展示；接收人侧已经不再下发
+	archived := make([]Slot, 0)
+	for _, s := range a.st.exportSlots() {
+		if !s.Deleted {
+			continue
+		}
+		if !all && s.Owner != u.ID {
+			continue
+		}
+		archived = append(archived, s)
+	}
+
+	resp := map[string]any{"members": members, "slots": slots, "archived": archived, "scope": u.scopeOf()}
 	if all {
 		users := []map[string]any{}
 		for _, x := range a.st.users() {
@@ -1954,6 +1966,9 @@ func (a *app) mine(w http.ResponseWriter, r *http.Request, u *User) {
 	slots := a.st.slotsFor(u.ID)
 	redacted := make([]map[string]any, 0, len(slots))
 	for _, s := range slots {
+		if s.Deleted {
+			continue // 归档后不再下发给接收人：历史只在 A 端保留
+		}
 		redacted = append(redacted, map[string]any{
 			"id": s.ID, "label": s.Label, "link": s.Link, "link_gen": s.LinkGen,
 			"submitted": s.Submitted, "deleted": s.Deleted,

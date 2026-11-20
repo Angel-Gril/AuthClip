@@ -42,6 +42,7 @@ const state = {
   resubmit: new Set(), // B 端点「重新提交」后临时展开表单
   ipRisk: null,        // B 端出口 IP 画像（提交前预览）
   me: null,            // 当前身份 {label, username}
+  showArchived: false, // A 端「已归档」是否展开
   stopStream: null,
 };
 
@@ -630,6 +631,50 @@ function slotStale(slot) {
   return Boolean(slot.state_param) && (!ls || slot.state_param !== ls);
 }
 
+// 已归档任务：只读展示（A 端保留历史，B 端不再可见）
+function archivedSlotCard(slot) {
+  const member = (state.board.members || []).find((m) => m.id === slot.member);
+  const copyAll = [slot.code, slot.email, slot.password, slot.reg_region, slot.reg_ip, slot.node_ip]
+    .filter(Boolean).join("\t");
+  const facts = el("dl", { class: "facts" },
+    fact("注册邮箱", slot.email),
+    fact("登录密码", slot.password, true),
+    fact("凭证 code", slot.code, true),
+    fact("注册地区", slot.reg_region),
+    fact("注册 IP", slot.reg_ip),
+    fact("节点 IP", slot.node_ip),
+    fact("回传时间", timeLabel(slot.submitted)),
+  );
+  return el("article", { class: "slot archived" },
+    el("div", { class: "slot-head" },
+      el("div", { class: "row" },
+        el("span", { class: "badge", text: "已归档" }),
+        el("span", { class: "slot-label", text: slot.label || "未命名" }),
+        el("span", { class: "muted", text: `→ ${member ? member.label : "未知接收人"}` }),
+        el("span", { class: "slot-id", text: `#${slot.id}` }),
+      ),
+      el("span", { class: "muted", text: timeLabel(slot.deleted_at) }),
+    ),
+    facts,
+    el("div", { class: "row" },
+      el("button", { type: "button", text: "复制凭证", disabled: !slot.code, onclick: () => { void copy(slot.code, "凭证已复制"); } }),
+      el("button", { type: "button", text: "复制整行", disabled: !copyAll, onclick: () => { void copy(copyAll, "已复制：code / 邮箱 / 密码 / 地区 / IP / 节点"); } }),
+      el("span", { class: "grow" }),
+      el("button", {
+        type: "button", class: "danger", text: "彻底删除",
+        onclick: async () => {
+          if (!window.confirm("彻底删除后无法恢复（对方也看不到）。确认？")) return;
+          try {
+            await api(`/api/slots/${slot.id}?purge=1`, { method: "DELETE" });
+            flash("已彻底删除");
+            await refresh();
+          } catch (e) { flash(errorMessage(e), "err"); }
+        },
+      }),
+    ),
+  );
+}
+
 function adminSlotCard(slot) {
   const member = (state.board.members || []).find((m) => m.id === slot.member);
   const filled = Boolean(slot.code || slot.email);
@@ -903,6 +948,22 @@ function adminView() {
       slots.length ? el("div", { class: "stack" }, slots.map(adminSlotCard))
         : el("div", { class: "card" }, el("p", { class: "muted", text: "还没有下发授权链接。" })),
     ),
+    (() => {
+      const archived = state.board.archived || [];
+      if (!archived.length) return null;
+      return el("div", { class: "stack" },
+        el("div", { class: "row" },
+          el("h2", { class: "section-title", text: `已归档（${archived.length}）` }),
+          el("span", { class: "grow" }),
+          el("button", {
+            type: "button", text: state.showArchived ? "收起" : "展开",
+            onclick: () => { state.showArchived = !state.showArchived; render(); },
+          }),
+        ),
+        el("p", { class: "hint", text: "A 端删除的任务留在这里；接收人已经看不到。" }),
+        state.showArchived ? el("div", { class: "stack" }, archived.map(archivedSlotCard)) : null,
+      );
+    })(),
     memberPanel(),
     usersPanel(),
     auditPanel(),
@@ -1195,7 +1256,6 @@ function memberCard(slot) {
 function memberView() {
   const all = state.mine.slots || [];
   const active = all.filter((s) => !s.deleted);
-  const history = all.filter((s) => s.deleted);
   const seen = state.mine.seen || {};
   // 画像拿不到时（上游不可用）退化为只显示出口 IP，保证「复制 IP」始终可用
   const prof = state.ipRisk || (seen.ip ? { ip: seen.ip, degraded: true } : null);
@@ -1224,14 +1284,9 @@ function memberView() {
     feedbackLine(),
     active.length ? copyGuide() : null,
     active.length ? el("div", { class: "stack" }, active.map(memberCard)) : null,
-    !active.length && !history.length
+    !active.length
       ? el("div", { class: "card" }, el("p", { class: "muted", text: "还没有收到授权任务，等对方下发。" }))
       : null,
-    history.length ? el("div", { class: "stack" },
-      el("h2", { text: "历史（只读）" }),
-      el("p", { class: "hint", text: "对方结束或归档的任务留在这里，方便你回看自己提交过什么。" }),
-      history.map(memberCard),
-    ) : null,
   );
 }
 

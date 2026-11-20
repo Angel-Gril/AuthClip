@@ -87,6 +87,10 @@ const DICT = {
   "撤回": ["撤回", "Undo"],
 
   // ---------- 下发 ----------
+  "已归档": ["已歸檔", "Archived"],
+  "展开": ["展開", "Expand"],
+  "收起": ["收合", "Collapse"],
+  "A 端删除的任务留在这里；接收人已经看不到。": ["A 端刪除的任務留在這裡；接收人已經看不到。", "Tasks deleted by the admin stay here; the member can no longer see them."],
   "回填结果": ["回填結果", "Results"],
   "下发授权链接": ["下發授權連結", "Publish a link"],
   "下发": ["下發", "Publish"],

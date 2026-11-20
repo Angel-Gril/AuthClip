@@ -383,7 +383,8 @@ func TestAuditTrail(t *testing.T) {
 	}
 }
 
-func TestArchiveKeepsMemberHistory(t *testing.T) {
+// v1.8.8：归档只在 A 端保留，接收人侧不再下发（此前是反的）
+func TestArchiveHidesFromMember(t *testing.T) {
 	e := newEnv(t, "")
 	id := e.newSlot(t, e.b1)
 	cb := "http://localhost:54545/callback?code=ARCH1&state=STATE-ONE"
@@ -398,19 +399,15 @@ func TestArchiveKeepsMemberHistory(t *testing.T) {
 	if _, board := e.call(t, "GET", "/api/board", e.admin.Token, nil); len(asSlice(board["slots"])) != 0 {
 		t.Fatal("归档后看板仍显示")
 	}
-	// B 的历史里仍在，且带 deleted 标记
+	// B 端：归档后不再下发
 	_, mine := e.call(t, "GET", "/api/mine", e.b1.Token, nil)
-	slots := asSlice(mine["slots"])
-	if len(slots) != 1 {
-		t.Fatalf("B 的历史应有 1 条，实际 %d", len(slots))
+	if n := len(asSlice(mine["slots"])); n != 0 {
+		t.Fatalf("归档任务不该再下发给接收人，实际 %d 条", n)
 	}
-	s := slots[0].(map[string]any)
-	// v1.7.3：B 端提交后内容一律不下发，历史里只剩状态与打码邮箱
-	if s["deleted"] != true || s["email"] != "b1***@example.com" {
-		t.Fatalf("历史摘要不对：%v", s)
-	}
-	if _, leaked := s["code"]; leaked {
-		t.Fatalf("历史里不该再出现 code：%v", s)
+	// A 端：归档列表里可见
+	_, board := e.call(t, "GET", "/api/board", e.admin.Token, nil)
+	if n := len(asSlice(board["archived"])); n != 1 {
+		t.Fatalf("A 端应看到 1 条归档，实际 %d", n)
 	}
 	// 归档后不能再回传
 	if code, _ := e.report(t, e.b1.Token, id, map[string]any{"email": "b1@example.com", "callback": cb}); code == http.StatusOK {
@@ -1345,5 +1342,31 @@ func TestNodeAcceptsProxyFormats(t *testing.T) {
 		"node_ip":  strings.Repeat("a", 201),
 	}); code != http.StatusBadRequest {
 		t.Fatalf("超长应 400，实际 %d", code)
+	}
+}
+
+// v1.8.8：归档只在 A 端保留，接收人不再收到已归档任务
+func TestArchivedHiddenFromMemberShownToAdmin(t *testing.T) {
+	e := newEnv(t, "")
+	id := e.newSlot(t, e.b1)
+	if code, _ := e.call(t, "DELETE", "/api/slots/"+id, e.admin.Token, nil); code != http.StatusOK {
+		t.Fatalf("归档失败: %d", code)
+	}
+	// B 端：不再下发
+	_, mine := e.call(t, "GET", "/api/mine", e.b1.Token, nil)
+	if n := len(asSlice(mine["slots"])); n != 0 {
+		t.Fatalf("归档任务不该再下发给接收人，实际 %d 条", n)
+	}
+	// A 端：看板 active 为空，但 archived 里有
+	_, board := e.call(t, "GET", "/api/board", e.admin.Token, nil)
+	if n := len(asSlice(board["slots"])); n != 0 {
+		t.Fatalf("看板不该显示归档任务，实际 %d", n)
+	}
+	arch := asSlice(board["archived"])
+	if len(arch) != 1 {
+		t.Fatalf("A 端应能看到 1 条归档，实际 %d", len(arch))
+	}
+	if arch[0].(map[string]any)["deleted"] != true {
+		t.Fatal("归档条目缺少 deleted 标记")
 	}
 }

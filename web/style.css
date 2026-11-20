@@ -194,3 +194,5 @@ button[disabled] { opacity: .45; cursor: default; }
 .top-actions { overflow: visible !important; }
 .section-title { font-size: 15px; margin: 4px 0 2px; }
 
+.slot.archived { opacity: .82; }
+
