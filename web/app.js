@@ -1,4 +1,5 @@
 // AuthClip 前端：长期链接（#a= / #b=）+ 回调链接自动解析
+import { LANGUAGES, getLocale, pickLocale, setLocale, t } from "./i18n.mjs";
 //
 // 说明：浏览器不允许读取其它标签页的地址栏，也不允许读 ERR_CONNECTION_REFUSED
 // 页面的 DOM。因此「自动抓取 localhost 回调」的可行路径只有两条：
@@ -14,6 +15,14 @@ const apiURL = (p) => new URL(String(p).replace(/^\/+/, ""), PAGE_ROOT).href;
 const appEl = document.querySelector("#app");
 const connEl = document.querySelector("#conn");
 const roleEl = document.querySelector("#role");
+const langSel = document.querySelector("#lang");
+
+// 语言：手动选择优先，其次浏览器语言；默认简体
+let manualLocale = localStorage.getItem("ac-locale") || "auto";
+function applyLocale() {
+  setLocale(pickLocale(manualLocale, navigator.languages));
+  document.documentElement.lang = getLocale();
+}
 
 const state = {
   role: "",
@@ -39,15 +48,32 @@ function el(tag, props = {}, ...children) {
   for (const [k, v] of Object.entries(props)) {
     if (v === false || v == null) continue;
     if (k === "class") n.className = v;
-    else if (k === "text") n.textContent = v;
+    else if (k === "text") n.textContent = t(v);
+    else if (k === "placeholder" || k === "title" || k === "aria-label") n.setAttribute(k, t(String(v)));
     else if (k.startsWith("on") && typeof v === "function") n.addEventListener(k.slice(2), v);
     else n.setAttribute(k, v === true ? "" : String(v));
   }
   for (const c of children.flat()) {
     if (c == null || c === false) continue;
-    n.append(c instanceof Node ? c : document.createTextNode(String(c)));
+    n.append(c instanceof Node ? c : document.createTextNode(t(String(c))));
   }
   return n;
+}
+
+// 内联 HTML（如图示 SVG）里的文案也要翻译：直接遍历文本节点
+function translateTree(root) {
+  for (const n of root.querySelectorAll("*")) {
+    for (const child of [...n.childNodes]) {
+      if (child.nodeType === Node.TEXT_NODE) {
+        const out = t(child.textContent);
+        if (out !== child.textContent) child.textContent = out;
+      }
+    }
+    for (const attr of ["placeholder", "title", "aria-label"]) {
+      const v = n.getAttribute?.(attr);
+      if (v) n.setAttribute(attr, t(v));
+    }
+  }
 }
 
 const mono = (t, cls = "mono") => el("span", { class: cls, text: t ?? "" });
@@ -63,9 +89,18 @@ function flash(text, kind = "ok") {
   render();
 }
 
+// 错误 → 可读文案（之前这个函数根本不存在，服务端报错会抛 ReferenceError）
+function errorMessage(err, fallback = "操作失败，请重试") {
+  const msg = err && err.message ? String(err.message) : "";
+  if (err?.status === 429) return "尝试过于频繁，请稍后重试";
+  if (err?.status === 401) return "链接无效或已被更换，请向发链接的人索取新的长期链接。";
+  if (msg && /[\u4e00-\u9fa5]/.test(msg)) return msg; // 服务端已给中文
+  return msg || fallback;
+}
+
 // 统一的「忙」执行器：先复位 busy 再渲染，避免错误后按钮被画成灰的却再也不恢复。
 // fn 内部只改 state.feedback，不直接 render（否则还是 busy=true 的那一帧）。
-async function busyRun(fn, { fallback = "error", focus = "" } = {}) {
+async function busyRun(fn, { fallback = "操作失败，请重试", focus = "" } = {}) {
   if (state.busy) return false;
   state.busy = true;
   state.feedback = "";
@@ -154,7 +189,7 @@ async function startStream() {
         });
         if (!res.ok) throw new Error(String(res.status));
         connEl.className = "conn on";
-        connEl.textContent = "实时已连接";
+        connEl.textContent = t("实时已连接");
         const reader = res.body.getReader();
         const dec = new TextDecoder();
         let buf = "";
@@ -172,7 +207,7 @@ async function startStream() {
       } catch {
         if (closed) return;
         connEl.className = "conn off";
-        connEl.textContent = "断开，重试中…";
+        connEl.textContent = t("断开，重试中…");
         await new Promise((r) => setTimeout(r, 2000));
       }
     }
@@ -801,7 +836,8 @@ function copyGuide() {
         el("span", { class: "hint", text: "：在对应任务中粘贴，或点该任务的「读剪贴板并解析」。" })),
     ),
   );
-  wrap.querySelector(".guide").innerHTML = `
+  const guide = wrap.querySelector(".guide");
+  guide.innerHTML = `
 <svg viewBox="0 0 800 140" role="img" aria-label="从地址栏复制回调链接的示意图" xmlns="http://www.w3.org/2000/svg">
   <rect x="1" y="1" width="798" height="138" rx="14" fill="#fbfcfb" stroke="#e4ebe6"/>
 
@@ -835,6 +871,7 @@ function copyGuide() {
   <rect x="556" y="86" width="212" height="22" rx="6" fill="#e6f3ed" stroke="#bfe0d0"/>
   <text x="566" y="102" font-family="ui-monospace, Consolas, monospace" font-size="10.5" fill="#146b4a">code = rd5sfX1UAH…</text>
 </svg>`;
+  translateTree(wrap.querySelector(".guide"));
   return wrap;
 }
 
@@ -1095,7 +1132,10 @@ function render() {
   connEl.hidden = !state.role;
   if (state.role) {
     roleEl.className = `chip ${state.role === "admin" ? "admin" : ""}`;
-    roleEl.textContent = state.role === "admin" ? "管理员" : "接收人";
+    roleEl.textContent = t(state.role === "admin" ? "管理员" : "接收人");
+    // 连接状态文案由 SSE 直接写 textContent，切换语言时要跟着重刷
+    connEl.textContent = t(connEl.classList.contains("on") ? "实时已连接"
+      : connEl.classList.contains("off") ? "断开，重试中…" : "连接中…");
   }
   const view = !state.token ? landing() : state.role === "admin" ? adminView() : memberView();
   appEl.setAttribute("aria-busy", "false");
@@ -1155,7 +1195,26 @@ document.addEventListener("visibilitychange", () => {
   void refresh();
 });
 
+// 语言选择器
+applyLocale();
+for (const [value, label] of LANGUAGES) {
+  const opt = el("option", { value, text: label });
+  if (value === manualLocale) opt.selected = true;
+  langSel.append(opt);
+}
+langSel.addEventListener("change", () => {
+  manualLocale = langSel.value;
+  localStorage.setItem("ac-locale", manualLocale);
+  applyLocale();
+  render();
+});
+
 void start();
+
+
+
+
+
 
 
 

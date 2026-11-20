@@ -156,3 +156,9 @@ button[disabled] { opacity: .45; cursor: default; }
 
 .warn-text { color: var(--warn) !important; }
 
+.lang { font: inherit; font-size: 12px; padding: 3px 6px; border: 1px solid var(--line); border-radius: 999px; background: #fff; color: var(--ink-soft); }
+
+.top-actions { flex-wrap: nowrap; }
+.chip, .conn { white-space: nowrap; flex: 0 0 auto; }
+.lang { flex: 0 0 auto; }
+

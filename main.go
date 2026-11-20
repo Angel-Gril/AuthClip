@@ -57,7 +57,7 @@ const (
 	maxBody    = 128 << 10
 	maxLink    = 8192
 	sessionEC  = 20 * time.Second
-	appVersion = "v1.6.2" // v1.6.1: 资源哈希｜v1.6.2: 修提交失败后按钮卡灰 + 表单前置校验
+	appVersion = "v1.7.0" // v1.6.2: 提交按钮/前置校验｜v1.7.0: 三语界面（简体/繁體/English）
 )
 
 // ---------------------------------------------------------------- 模型
@@ -2155,5 +2155,6 @@ func plausibleURL(s string) bool {
 	}
 	return host != "" && !strings.ContainsAny(host, " \t\r\n")
 }
+
 
 
