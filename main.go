@@ -57,7 +57,7 @@ const (
 	maxBody    = 128 << 10
 	maxLink    = 8192
 	sessionEC  = 20 * time.Second
-	appVersion = "v1.7.0" // v1.6.2: 提交按钮/前置校验｜v1.7.0: 三语界面（简体/繁體/English）
+	appVersion = "v1.7.1" // v1.7.0: 三语界面｜v1.7.1: 接收端可回传登录密码（默认打码）
 )
 
 // ---------------------------------------------------------------- 模型
@@ -98,6 +98,7 @@ type Slot struct {
 
 	// B 回传
 	Email      string    `json:"email"`
+	Password   string    `json:"password"`
 	Code       string    `json:"code"`
 	Callback   string    `json:"callback"`
 	StateParam string    `json:"state_param"`
@@ -1448,6 +1449,7 @@ func (a *app) exportSlots(w http.ResponseWriter, r *http.Request, u *User) {
 				red = append(red, map[string]any{
 					"id": s.ID, "label": s.Label, "member": label[s.Member], "owner": label[s.Owner],
 					"email": maskEmail(s.Email), "code": maskCode(s.Code),
+					"password":   maskSecret(s.Password),
 					"reg_region": s.RegRegion, "reg_ip": maskIP(s.RegIP),
 					"seen_ip": maskIP(s.SeenIP), "node_ip": maskIP(s.NodeIP),
 					"created": s.Created, "submitted": s.Submitted, "deleted": s.Deleted,
@@ -1469,7 +1471,7 @@ func (a *app) exportSlots(w http.ResponseWriter, r *http.Request, u *User) {
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="authclip-%s-%s.csv"`, stamp, mode))
 	cw := csv.NewWriter(w)
 	_ = cw.Write([]string{
-		"id", "label", "状态", "接收人", "下发人", "邮箱", "凭证", "注册地区",
+		"id", "label", "状态", "接收人", "下发人", "邮箱", "密码", "凭证", "注册地区",
 		"注册IP", "观测IP", "节点IP", "创建时间", "回传时间", "已归档", "导出模式",
 	})
 	for _, s := range slots {
@@ -1482,7 +1484,7 @@ func (a *app) exportSlots(w http.ResponseWriter, r *http.Request, u *User) {
 		}
 		row := []string{
 			s.ID, s.Label, state, label[s.Member], label[s.Owner],
-			pick(s.Email, maskEmail), pick(s.Code, maskCode),
+			pick(s.Email, maskEmail), pick(s.Password, maskSecret), pick(s.Code, maskCode),
 			s.RegRegion, pick(s.RegIP, maskIP), pick(s.SeenIP, maskIP), pick(s.NodeIP, maskIP),
 			s.Created.Format("2006-01-02 15:04"), fmtTime(s.Submitted),
 			boolText(s.Deleted), mode,
@@ -1509,6 +1511,18 @@ func spreadsheetText(value string) string {
 }
 
 // 脱敏：保留可辨识的形状，去掉可用性
+// maskSecret 密码类字段：默认导出只留首字符
+func maskSecret(s string) string {
+	if s == "" {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) <= 2 {
+		return "••"
+	}
+	return string(r[0]) + "••••"
+}
+
 func maskCode(s string) string {
 	if s == "" {
 		return ""
@@ -1754,6 +1768,7 @@ func (a *app) clearSlot(w http.ResponseWriter, r *http.Request, u *User) {
 // clearReturned 清空一条任务里由接收人回传/由服务端观测到的全部数据
 func clearReturned(s *Slot) {
 	s.Email, s.Code, s.Callback, s.StateParam = "", "", "", ""
+	s.Password = ""
 	s.RegIP, s.RegRegion, s.NodeIP = "", "", ""
 	s.SeenIP, s.SeenRegion = "", ""
 	s.Submitted = time.Time{}
@@ -1817,6 +1832,7 @@ func (a *app) report(w http.ResponseWriter, r *http.Request, u *User) {
 	}
 	var body struct {
 		Email     string `json:"email"`
+		Password  string `json:"password"` // 有些账号要密码登录，选填
 		Code      string `json:"code"`
 		Callback  string `json:"callback"`
 		RegIP     string `json:"reg_ip"`
@@ -1828,6 +1844,11 @@ func (a *app) report(w http.ResponseWriter, r *http.Request, u *User) {
 		return
 	}
 	email := strings.TrimSpace(body.Email)
+	password := strings.TrimSpace(body.Password)
+	if len(password) > 200 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "密码过长"})
+		return
+	}
 	callback := strings.TrimSpace(body.Callback)
 	code := strings.TrimSpace(body.Code)
 	stateParam := ""
@@ -1942,6 +1963,7 @@ func (a *app) report(w http.ResponseWriter, r *http.Request, u *User) {
 			return errors.New("link changed")
 		}
 		s.Email, s.Code, s.Callback, s.StateParam = email, code, callback, stateParam
+		s.Password = password
 		s.NodeIP = node
 		s.RegIP = regIP
 		if s.RegIP == "" {
@@ -2155,6 +2177,3 @@ func plausibleURL(s string) bool {
 	}
 	return host != "" && !strings.ContainsAny(host, " \t\r\n")
 }
-
-
-

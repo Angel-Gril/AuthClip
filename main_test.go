@@ -1156,3 +1156,45 @@ func TestChineseUsernameWorks(t *testing.T) {
 		t.Fatalf("按中文用户名下发失败：%d %v", code, out)
 	}
 }
+
+// v1.7.1：接收端可回传登录密码；默认导出必须打码
+func TestPasswordReportAndMasking(t *testing.T) {
+	e := newEnv(t, "")
+	id := e.newSlot(t, e.b1)
+
+	if code, out := e.report(t, e.b1.Token, id, map[string]any{
+		"email": "pw@example.com", "password": "S3cret!pass",
+		"callback": "http://localhost:54545/callback?code=PWC&state=STATE-ONE",
+	}); code != http.StatusOK {
+		t.Fatalf("回传失败: %d %v", code, out)
+	}
+	if s := e.app.st.slotByID(id); s.Password != "S3cret!pass" {
+		t.Fatalf("密码未落库: %q", s.Password)
+	}
+
+	// 脱敏导出：出现打码，不出现明文
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/export?format=csv", nil)
+	e.app.exportSlots(rec, req, e.admin)
+	body := rec.Body.String()
+	if strings.Contains(body, "S3cret!pass") {
+		t.Fatal("脱敏导出里出现了明文密码")
+	}
+	if !strings.Contains(body, "S••••") {
+		t.Fatalf("脱敏导出里没有打码痕迹: %s", body)
+	}
+
+	// 完整导出：必须有明文（管理员二次确认后）
+	rec2 := httptest.NewRecorder()
+	req2 := httptest.NewRequest(http.MethodGet, "/api/export?format=csv&secrets=1&confirm=EXPORT", nil)
+	e.app.exportSlots(rec2, req2, e.admin)
+	if !strings.Contains(rec2.Body.String(), "S3cret!pass") {
+		t.Fatal("完整导出缺少明文密码")
+	}
+
+	// 清空回传必须连密码一起清
+	e.call(t, "POST", "/api/slots/"+id+"/clear", e.admin.Token, map[string]any{})
+	if s := e.app.st.slotByID(id); s.Password != "" {
+		t.Fatalf("清空后密码残留: %q", s.Password)
+	}
+}

@@ -230,6 +230,7 @@ function roundFor(slot) {
     gen,
     callback: slot.callback || "",
     email: slot.email || "",
+    password: slot.password || "",
     regIp: slot.reg_ip || state.mine.seen?.ip || "",
     regRegion: slot.reg_region || state.mine.seen?.region || "",
     nodeIp: slot.node_ip || "",
@@ -615,11 +616,12 @@ function adminSlotCard(slot) {
   const regionInput = el("input", { placeholder: "地区，如 JP", maxlength: 2 });
   regionInput.value = slot.reg_region || "";
 
-  const copyAll = [slot.code, slot.email, slot.reg_region, slot.reg_ip, slot.node_ip]
+  const copyAll = [slot.code, slot.email, slot.password, slot.reg_region, slot.reg_ip, slot.node_ip]
     .filter(Boolean).join("\t");
 
   const facts = el("dl", { class: "facts" },
     fact("注册邮箱", slot.email),
+    fact("登录密码", slot.password, true),
     fact("凭证 code", slot.code, true),
     fact("注册地区", slot.reg_region),
     fact("注册 IP", slot.reg_ip),
@@ -739,7 +741,7 @@ function adminSlotCard(slot) {
             type: "button", text: "复制整行", disabled: !copyAll,
             onclick: () => {
               if (stale && !window.confirm("这条回传与当前链接不一致（可能来自上一轮）。\n仍要复制吗？")) return;
-              void copy(copyAll, "已复制：code / 邮箱 / 地区 / IP / 节点");
+              void copy(copyAll, "已复制：code / 邮箱 / 密码 / 地区 / IP / 节点");
             },
           }),
         ),
@@ -902,7 +904,8 @@ function memberCard(slot) {
       el("dl", { class: "facts" },
         fact("授权链接", slot.link, true),
         fact("注册邮箱", slot.email),
-        fact("凭证 code", slot.code, true),
+        fact("登录密码", slot.password, true),
+    fact("凭证 code", slot.code, true),
         fact("注册地区", slot.reg_region),
         fact("注册 IP", slot.reg_ip),
         fact("节点 IP", slot.node_ip),
@@ -926,8 +929,17 @@ function memberCard(slot) {
   const match = parsed && parsed.state && linkState ? (parsed.state === linkState) : null;
 
   const email = el("input", { type: "email", autocomplete: "off", maxlength: 254, placeholder: "注册这个账号用的邮箱" });
+  // 有些账号要密码登录；默认 type=password，可一键显示
+  const passwordInput = el("input", { type: "password", autocomplete: "new-password", maxlength: 200, placeholder: "该账号的登录密码（不需要可留空）" });
+  const passwordToggle = el("button", { type: "button", class: "ghost", text: "显示", onclick: () => {
+    const show = passwordInput.type === "password";
+    passwordInput.type = show ? "text" : "password";
+    passwordToggle.textContent = t(show ? "隐藏" : "显示");
+  } });
   email.value = round.email;
   email.addEventListener("input", () => set({ email: email.value }));
+  passwordInput.value = round.password;
+  passwordInput.addEventListener("input", () => set({ password: passwordInput.value }));
 
   const callback = el("textarea", {
     class: "tall", spellcheck: "false",
@@ -1000,6 +1012,7 @@ function memberCard(slot) {
       await api(`/api/slots/${slot.id}/report`, {
         body: {
           email: email.value,
+          password: passwordInput.value,
           callback: callback.value,
           code: "",
           reg_ip: regIp.value,
@@ -1056,7 +1069,14 @@ function memberCard(slot) {
       parsed?.auth ? el("p", { class: "feedback err", text: "这是授权链接本身（含 code_challenge），不是回调链接。请先点开完成授权。" }) : null,
       el("div", { class: "grid-2" },
         el("label", {}, "注册邮箱", email),
+        el("div", { class: "stack" },
+          el("label", {}, "登录密码（如该账号需要）"),
+          el("div", { class: "row" }, passwordInput, passwordToggle),
+        ),
+      ),
+      el("div", { class: "grid-2" },
         el("label", {}, "注册地区（两位国家码）", regRegion),
+        el("span", {}),
       ),
       el("div", { class: "grid-2" },
         el("label", {}, "注册区域 IP", regIp),
@@ -1210,6 +1230,7 @@ langSel.addEventListener("change", () => {
 });
 
 void start();
+
 
 
 
