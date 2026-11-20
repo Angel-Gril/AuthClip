@@ -25,6 +25,7 @@ import (
 	"crypto/sha256"
 	"encoding/base32"
 	"encoding/csv"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -56,7 +57,7 @@ const (
 	maxBody    = 128 << 10
 	maxLink    = 8192
 	sessionEC  = 20 * time.Second
-	appVersion = "v1.6.0" // v1.5.4: 合并 CSV 实现｜v1.6.0: 支持中文用户名 / 区分非法与占用
+	appVersion = "v1.6.1" // v1.6.0: 中文用户名｜v1.6.1: 静态资源带内容哈希，杜绝旧/坏缓存
 )
 
 // ---------------------------------------------------------------- 模型
@@ -957,6 +958,9 @@ func (a *app) headers(next http.Handler) http.Handler {
 
 func (a *app) static(root fs.FS) http.Handler {
 	files := http.FileServer(http.FS(root))
+	// 资源版本号：内容一变 URL 就变，浏览器/中间层不可能再复用旧的或坏掉的缓存
+	ver := assetVersion(root)
+	index := renderIndex(root, ver)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasPrefix(r.URL.Path, "/api/") {
 			conn := "connect-src 'self'"
@@ -967,8 +971,36 @@ func (a *app) static(root fs.FS) http.Handler {
 				"default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; "+
 					conn+"; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
 		}
+		if r.URL.Path == "/" || r.URL.Path == "/index.html" {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.Header().Set("Cache-Control", "no-store")
+			_, _ = w.Write(index)
+			return
+		}
 		files.ServeHTTP(w, r)
 	})
+}
+
+// assetVersion 以样式与脚本的内容哈希作为版本号
+func assetVersion(root fs.FS) string {
+	h := sha256.New()
+	for _, name := range []string{"style.css", "app.js"} {
+		if b, err := fs.ReadFile(root, name); err == nil {
+			_, _ = h.Write(b)
+		}
+	}
+	return hex.EncodeToString(h.Sum(nil))[:8]
+}
+
+// renderIndex 给 index.html 里的资源引用补上 ?v=哈希
+func renderIndex(root fs.FS, ver string) []byte {
+	b, err := fs.ReadFile(root, "index.html")
+	if err != nil {
+		return []byte("<!doctype html><title>AuthClip</title>")
+	}
+	out := strings.ReplaceAll(string(b), `href="style.css"`, `href="style.css?v=`+ver+`"`)
+	out = strings.ReplaceAll(out, `src="app.js"`, `src="app.js?v=`+ver+`"`)
+	return []byte(out)
 }
 
 func originOf(raw string) string {
